@@ -9,6 +9,7 @@ import androidx.core.app.NotificationCompat
 import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
 import com.proxyguard.R
+import com.proxyguard.proxy.ProxyRepository
 import com.proxyguard.proxy.ProxyPool
 import com.proxyguard.proxy.ProxyValidator
 import com.proxyguard.relay.BridgeSecret
@@ -17,36 +18,67 @@ import com.proxyguard.source.SourceParser
 import com.proxyguard.ui.MainActivity
 import kotlinx.coroutines.*
 
-/**
- * ForegroundService — сердце приложения.
- *
- * Запускает LocalRelayServer и периодически:
- *   1. Обновляет список прокси (каждые UPDATE_INTERVAL_MIN минут)
- *   2. Проверяет здоровье текущего прокси (каждые HEALTH_CHECK_INTERVAL_SEC секунд)
- */
 class ProxyGuardService : LifecycleService() {
 
     private lateinit var relayServer: LocalRelayServer
     private val proxyPool    = ProxyPool()
     private val validator    = ProxyValidator()
     private val sourceParser = SourceParser()
+    private lateinit var repository: ProxyRepository
 
     @Volatile private var isUpdating = false
 
+    // Публичный статус для UI
+    companion object {
+        private const val TAG             = "ProxyGuardService"
+        const val PORT                    = 1080
+        const val ACTION_STOP             = "com.proxyguard.STOP"
+        const val ACTION_REFRESH          = "com.proxyguard.REFRESH"
+        const val ACTION_STATUS           = "com.proxyguard.STATUS"
+        const val EXTRA_STATUS_TEXT       = "status_text"
+        const val EXTRA_POOL_SIZE         = "pool_size"
+        private const val NOTIFICATION_ID = 1001
+        private const val CHANNEL_ID      = "proxyguard_status"
+        private const val UPDATE_INTERVAL = 15 * 60 * 1000L  // 15 минут
+
+        fun start(context: Context) =
+            context.startForegroundService(Intent(context, ProxyGuardService::class.java))
+
+        fun stop(context: Context) =
+            context.startService(Intent(context, ProxyGuardService::class.java).setAction(ACTION_STOP))
+
+        fun refresh(context: Context) =
+            context.startService(Intent(context, ProxyGuardService::class.java).setAction(ACTION_REFRESH))
+    }
+
     override fun onCreate() {
         super.onCreate()
-        startForeground(NOTIFICATION_ID, buildNotification("Инициализация..."))
+        startForeground(NOTIFICATION_ID, buildNotification("Запуск..."))
+        repository = ProxyRepository(this)
 
         val bridgeSecret = BridgeSecret.getBytes(this)
         relayServer = LocalRelayServer(PORT, bridgeSecret, proxyPool)
         relayServer.start()
 
+        // Планируем WorkManager как резервный механизм
+        ProxyUpdateWorker.schedule(this)
+
         lifecycleScope.launch {
-            // Первое обновление — сразу
+            // Сначала пробуем загрузить кэш — быстрый старт
+            val cached = repository.load()
+            if (cached.isNotEmpty()) {
+                proxyPool.update(cached)
+                val best = cached.first()
+                notify("✓ Кэш: ${best.proxy.server} (${best.pingMs}ms) | Пул: ${cached.size}")
+                Log.i(TAG, "Loaded ${cached.size} proxies from cache")
+            }
+
+            // Полное обновление
             updateProxies()
+
             // Периодическое обновление
             while (isActive) {
-                delay(UPDATE_INTERVAL_MS)
+                delay(UPDATE_INTERVAL)
                 updateProxies()
             }
         }
@@ -55,41 +87,37 @@ class ProxyGuardService : LifecycleService() {
     private suspend fun updateProxies() {
         if (isUpdating) return
         isUpdating = true
-        updateNotification("Обновление списка прокси...")
 
         try {
-            Log.i(TAG, "Fetching proxy sources...")
-            val all = sourceParser.fetchAll { name, count ->
-                Log.d(TAG, "Source '$name': $count proxies")
-            }
+            notify("Загрузка источников...")
+            val all = sourceParser.fetchAll()
 
             if (all.isEmpty()) {
-                Log.w(TAG, "No proxies fetched from any source")
-                updateNotification("Нет прокси. Повтор через $UPDATE_INTERVAL_MIN мин.")
+                notify("⚠ Нет прокси. Повтор через 15 мин.")
                 return
             }
 
-            updateNotification("Проверка ${all.size} прокси...")
-            Log.i(TAG, "Validating ${all.size} proxies...")
-
+            notify("Проверка ${all.size} прокси...")
             val ranked = validator.validateAll(all, batchSize = 20) { done, total ->
-                if (done % 40 == 0) updateNotification("Проверка: $done/$total...")
+                if (done % 60 == 0) notify("Проверка: $done/$total...")
             }
 
             if (ranked.isEmpty()) {
-                Log.w(TAG, "No live proxies found")
-                updateNotification("Нет рабочих прокси. Повтор через $UPDATE_INTERVAL_MIN мин.")
+                notify("⚠ Нет рабочих прокси. Повтор через 15 мин.")
                 return
             }
 
             proxyPool.update(ranked)
+            repository.save(ranked)
+
             val best = ranked.first()
-            Log.i(TAG, "Pool updated: ${ranked.size} live. Best: ${best.proxy.server} ${best.pingMs}ms")
-            updateNotification("✓ Активен: ${best.proxy.server} (${best.pingMs}ms) | Пул: ${ranked.size}")
+            val text = "✓ ${best.proxy.server}  ${best.pingMs}ms | Пул: ${ranked.size}"
+            notify(text)
+            broadcastStatus(text, ranked.size)
 
         } catch (e: Exception) {
-            Log.e(TAG, "Update failed: ${e.message}")
-            updateNotification("Ошибка обновления. Повтор через $UPDATE_INTERVAL_MIN мин.")
+            Log.e(TAG, "Update error: ${e.message}")
+            notify("⚠ Ошибка обновления. Повтор через 15 мин.")
         } finally {
             isUpdating = false
         }
@@ -98,7 +126,7 @@ class ProxyGuardService : LifecycleService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
         when (intent?.action) {
-            ACTION_STOP -> stopSelf()
+            ACTION_STOP    -> stopSelf()
             ACTION_REFRESH -> lifecycleScope.launch { updateProxies() }
         }
         return START_STICKY
@@ -107,46 +135,41 @@ class ProxyGuardService : LifecycleService() {
     override fun onDestroy() {
         relayServer.stop()
         super.onDestroy()
+        Log.i(TAG, "Service destroyed")
     }
 
-    override fun onBind(intent: Intent): IBinder? {
-        super.onBind(intent)
-        return null
+    override fun onBind(intent: Intent): IBinder? { super.onBind(intent); return null }
+
+    private fun broadcastStatus(text: String, poolSize: Int) {
+        sendBroadcast(Intent(ACTION_STATUS).apply {
+            putExtra(EXTRA_STATUS_TEXT, text)
+            putExtra(EXTRA_POOL_SIZE, poolSize)
+        })
     }
 
-    // ─── Notification ────────────────────────────────────────────────────────
-
-    private fun updateNotification(text: String) {
+    private fun notify(text: String) {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         nm.notify(NOTIFICATION_ID, buildNotification(text))
     }
 
     private fun buildNotification(text: String): Notification {
         ensureChannel()
-
-        val openIntent = PendingIntent.getActivity(
-            this, 0,
-            Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE,
-        )
-        val stopIntent = PendingIntent.getService(
-            this, 1,
-            Intent(this, ProxyGuardService::class.java).setAction(ACTION_STOP),
-            PendingIntent.FLAG_IMMUTABLE,
-        )
-        val refreshIntent = PendingIntent.getService(
-            this, 2,
-            Intent(this, ProxyGuardService::class.java).setAction(ACTION_REFRESH),
-            PendingIntent.FLAG_IMMUTABLE,
-        )
+        val open = PendingIntent.getActivity(
+            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+        val stop = PendingIntent.getService(
+            this, 1, Intent(this, ProxyGuardService::class.java).setAction(ACTION_STOP),
+            PendingIntent.FLAG_IMMUTABLE)
+        val refresh = PendingIntent.getService(
+            this, 2, Intent(this, ProxyGuardService::class.java).setAction(ACTION_REFRESH),
+            PendingIntent.FLAG_IMMUTABLE)
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_shield)
             .setContentTitle("ProxyGuard")
             .setContentText(text)
-            .setContentIntent(openIntent)
-            .addAction(0, "Обновить", refreshIntent)
-            .addAction(0, "Стоп", stopIntent)
+            .setContentIntent(open)
+            .addAction(0, "🔄", refresh)
+            .addAction(0, "⏹", stop)
             .setOngoing(true)
             .setSilent(true)
             .build()
@@ -155,29 +178,8 @@ class ProxyGuardService : LifecycleService() {
     private fun ensureChannel() {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         if (nm.getNotificationChannel(CHANNEL_ID) != null) return
-        NotificationChannel(CHANNEL_ID, "ProxyGuard", NotificationManager.IMPORTANCE_LOW)
+        NotificationChannel(CHANNEL_ID, "ProxyGuard статус", NotificationManager.IMPORTANCE_LOW)
             .apply { description = "MTProto relay status" }
             .also { nm.createNotificationChannel(it) }
-    }
-
-    companion object {
-        private const val TAG              = "ProxyGuardService"
-        const val PORT                     = 1080
-        const val ACTION_STOP              = "com.proxyguard.STOP"
-        const val ACTION_REFRESH           = "com.proxyguard.REFRESH"
-        private const val NOTIFICATION_ID  = 1001
-        private const val CHANNEL_ID       = "proxyguard_status"
-        private const val UPDATE_INTERVAL_MIN = 15L
-        private const val UPDATE_INTERVAL_MS  = UPDATE_INTERVAL_MIN * 60 * 1000L
-
-        fun start(context: Context) {
-            val intent = Intent(context, ProxyGuardService::class.java)
-            context.startForegroundService(intent)
-        }
-
-        fun stop(context: Context) {
-            val intent = Intent(context, ProxyGuardService::class.java).setAction(ACTION_STOP)
-            context.startService(intent)
-        }
     }
 }

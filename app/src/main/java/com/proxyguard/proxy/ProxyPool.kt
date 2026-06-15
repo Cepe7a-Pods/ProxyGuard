@@ -1,55 +1,45 @@
 package com.proxyguard.proxy
 
 import android.util.Log
-import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Потокобезопасный пул прокси, отсортированных по пингу.
- * При падении прокси — помечаем как плохой, используем следующий.
+ *
+ * Используем @Volatile + synchronized для простоты и надёжности.
+ * Писатель один (сервис обновления), читателей много (relay-соединения).
  */
 class ProxyPool {
 
-    private val state = AtomicReference(State())
+    @Volatile private var sorted: List<MtProtoProxy> = emptyList()
+    @Volatile private var failed: Set<String>        = emptySet()
 
-    data class State(
-        val sorted: List<MtProtoProxy> = emptyList(),
-        val failed: Set<String> = emptySet(),  // server:port
-    )
-
-    /** Обновляем пул после очередной валидации */
+    /** Полная замена пула после валидации */
+    @Synchronized
     fun update(ranked: List<RankedProxy>) {
-        val sorted = ranked.sortedBy { it.pingMs }.map { it.proxy }
-        state.updateAndGet { it.copy(sorted = sorted, failed = emptySet()) }
-        Log.i(TAG, "Pool updated: ${sorted.size} proxies")
+        sorted = ranked.sortedBy { it.pingMs }.map { it.proxy }
+        failed = emptySet()
+        Log.i(TAG, "Pool updated: ${sorted.size} proxies. Best: ${sorted.firstOrNull()?.server}")
         sorted.take(3).forEachIndexed { i, p ->
-            Log.d(TAG, "  #${i+1}: ${p.server}:${p.port} (${ranked.find { r -> r.proxy == p }?.pingMs}ms)")
+            val ping = ranked.find { it.proxy == p }?.pingMs
+            Log.d(TAG, "  #${i + 1}: ${p.server}:${p.port}  ping=${ping}ms")
         }
     }
 
-    /** Лучший доступный прокси (не в списке failed) */
-    fun getBest(): MtProtoProxy? {
-        val s = state.get()
-        return s.sorted.firstOrNull { it.key() !in s.failed }
-    }
+    /** Лучший живой прокси (не в списке упавших) */
+    fun getBest(): MtProtoProxy? = sorted.firstOrNull { it.key() !in failed }
 
-    /** Помечаем прокси как упавший — следующий getBest() вернёт другой */
+    /** Помечаем прокси как нерабочий — следующий getBest() вернёт другой */
+    @Synchronized
     fun markFailed(proxy: MtProtoProxy) {
-        state.updateAndGet { it.copy(failed = it.failed + proxy.key()) }
-        Log.w(TAG, "Proxy marked failed: ${proxy.server}:${proxy.port}")
+        failed = failed + proxy.key()
+        Log.w(TAG, "Marked failed: ${proxy.server}:${proxy.port}. Failed count: ${failed.size}/${sorted.size}")
     }
 
-    fun size(): Int = state.get().sorted.size
-    fun isEmpty(): Boolean = size() == 0
+    fun size(): Int      = sorted.size
+    fun isEmpty(): Boolean = sorted.isEmpty()
+    fun all(): List<MtProtoProxy> = sorted
 
     private fun MtProtoProxy.key() = "$server:$port"
 
     companion object { private const val TAG = "ProxyPool" }
-}
-
-private fun <T> AtomicReference<T>.updateAndGet(update: (T) -> T): T {
-    while (true) {
-        val current = get()
-        val next = update(current)
-        if (compareAndSet(current, next)) return next
-    }
 }

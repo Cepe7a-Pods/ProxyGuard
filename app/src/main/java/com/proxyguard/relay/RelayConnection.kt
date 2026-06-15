@@ -8,16 +8,6 @@ import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
 
-/**
- * Обрабатывает одно входящее соединение от Telegram.
- *
- * Жизненный цикл:
- *   1. Читаем 64-байтовый MTProto nonce от Telegram
- *   2. Выводим ключи (bridge secret)
- *   3. Подключаемся к лучшему внешнему прокси
- *   4. Отправляем ему наш nonce (proxy secret)
- *   5. Запускаем двунаправленный relay с перешифрованием
- */
 class RelayConnection(
     private val telegramSocket: Socket,
     private val proxyPool: ProxyPool,
@@ -25,88 +15,82 @@ class RelayConnection(
 ) {
 
     suspend fun handle() {
-        // 1. Читаем 64-байтовый nonce от Telegram
         val init = ByteArray(64)
         try {
             telegramSocket.getInputStream().readFully(init)
         } catch (e: Exception) {
-            Log.w(TAG, "Failed to read init from Telegram: ${e.message}")
-            telegramSocket.close()
-            return
+            Log.w(TAG, "Init read failed: ${e.message}")
+            telegramSocket.close(); return
         }
 
-        // 2. Выводим ключи из nonce + bridge secret
         val (protocolTag, bridgeCipher) = MtProtoObfuscation.fromClientInit(init, bridgeSecret)
-
-        // Проверяем тег — должен быть padded intermediate
         if (!protocolTag.contentEquals(MtProtoObfuscation.PADDED_INTERMEDIATE_TAG)) {
-            Log.w(TAG, "Unknown protocol tag: ${protocolTag.toHex()}, dropping")
-            telegramSocket.close()
-            return
+            Log.w(TAG, "Unknown tag: ${protocolTag.toHex()}")
+            telegramSocket.close(); return
         }
 
-        // Убираем жёсткий таймаут — соединение может жить долго
         telegramSocket.soTimeout = 0
 
-        // 3. Берём лучший прокси из пула
         val proxy = proxyPool.getBest()
         if (proxy == null) {
-            Log.e(TAG, "No proxies available in pool")
-            telegramSocket.close()
-            return
+            Log.e(TAG, "No proxies available")
+            telegramSocket.close(); return
         }
 
-        // 4. Подключаемся к внешнему прокси
         val proxySocket = try {
             Socket().apply {
                 tcpNoDelay = true
-                connect(InetSocketAddress(proxy.server, proxy.port), PROXY_CONNECT_TIMEOUT_MS)
+                connect(InetSocketAddress(proxy.server, proxy.port), CONNECT_TIMEOUT)
                 soTimeout = 0
             }
         } catch (e: Exception) {
-            Log.w(TAG, "Cannot connect to ${proxy.server}:${proxy.port}: ${e.message}")
+            Log.w(TAG, "Connect to ${proxy.server}:${proxy.port} failed: ${e.message}")
             proxyPool.markFailed(proxy)
-            telegramSocket.close()
-            return
+            telegramSocket.close(); return
         }
 
-        // 5. Отправляем наш nonce внешнему прокси
         val (initToSend, proxyCipher) = MtProtoObfuscation.generateForProxy(proxy.secretBytes)
         try {
             proxySocket.getOutputStream().write(initToSend)
             proxySocket.getOutputStream().flush()
         } catch (e: Exception) {
-            Log.w(TAG, "Cannot send init to proxy: ${e.message}")
-            telegramSocket.close()
-            proxySocket.close()
-            return
+            Log.w(TAG, "Proxy init send failed: ${e.message}")
+            telegramSocket.close(); proxySocket.close(); return
         }
 
-        Log.d(TAG, "Relay established: Telegram ↔ ${proxy.server}:${proxy.port}")
+        Log.d(TAG, "Relay up: Telegram ↔ ${proxy.server}:${proxy.port}")
 
-        // 6. Двунаправленный relay
+        // ВАЖНО: блокирующий read() не прерывается отменой корутины.
+        // Единственный способ разбудить заблокированный поток — закрыть сокет.
+        // Поэтому в invokeOnCompletion закрываем ОБА сокета, а не только отменяем job.
         try {
             coroutineScope {
-                // Telegram → External Proxy
                 val t2p = launch(Dispatchers.IO) {
-                    pipe(
-                        from = telegramSocket.getInputStream(),
-                        to   = proxySocket.getOutputStream(),
-                    ) { chunk -> proxyCipher.encrypt(bridgeCipher.decrypt(chunk)) }
+                    pipe(telegramSocket.getInputStream(), proxySocket.getOutputStream()) { chunk ->
+                        proxyCipher.encrypt(bridgeCipher.decrypt(chunk))
+                    }
                 }
-                // External Proxy → Telegram
                 val p2t = launch(Dispatchers.IO) {
-                    pipe(
-                        from = proxySocket.getInputStream(),
-                        to   = telegramSocket.getOutputStream(),
-                    ) { chunk -> bridgeCipher.encrypt(proxyCipher.decrypt(chunk)) }
+                    pipe(proxySocket.getInputStream(), telegramSocket.getOutputStream()) { chunk ->
+                        bridgeCipher.encrypt(proxyCipher.decrypt(chunk))
+                    }
                 }
-                // Если одно направление закрылось — завершаем оба
-                t2p.invokeOnCompletion { p2t.cancel() }
-                p2t.invokeOnCompletion { t2p.cancel() }
+
+                // Когда одно направление упало — закрываем сокеты.
+                // Это прерывает блокирующий read() в другом направлении.
+                t2p.invokeOnCompletion {
+                    p2t.cancel()
+                    runCatching { telegramSocket.close() }
+                    runCatching { proxySocket.close() }
+                }
+                p2t.invokeOnCompletion {
+                    t2p.cancel()
+                    runCatching { telegramSocket.close() }
+                    runCatching { proxySocket.close() }
+                }
             }
         } catch (_: CancellationException) {
-            // нормальное завершение через cancel()
+            // нормальное завершение
         } catch (e: Exception) {
             Log.w(TAG, "Relay error: ${e.message}")
             proxyPool.markFailed(proxy)
@@ -122,34 +106,31 @@ class RelayConnection(
         to: OutputStream,
         transform: (ByteArray) -> ByteArray,
     ) {
-        val buffer = ByteArray(BUFFER_SIZE)
+        val buf = ByteArray(BUFFER_SIZE)
         try {
             while (true) {
-                val n = from.read(buffer)
+                val n = from.read(buf)
                 if (n < 0) break
-                val transformed = transform(buffer.copyOfRange(0, n))
-                to.write(transformed)
+                to.write(transform(buf.copyOfRange(0, n)))
                 to.flush()
             }
-        } catch (_: Exception) {
-            // соединение закрыто с той или другой стороны
-        }
+        } catch (_: Exception) { /* сокет закрыт — штатный выход */ }
     }
 
     private fun ByteArray.toHex() = joinToString("") { "%02x".format(it) }
 
     companion object {
-        private const val TAG = "RelayConnection"
-        private const val PROXY_CONNECT_TIMEOUT_MS = 10_000
-        private const val BUFFER_SIZE = 8192
+        private const val TAG           = "RelayConnection"
+        private const val CONNECT_TIMEOUT = 10_000
+        private const val BUFFER_SIZE   = 8192
     }
 }
 
 fun InputStream.readFully(buf: ByteArray) {
-    var offset = 0
-    while (offset < buf.size) {
-        val n = read(buf, offset, buf.size - offset)
-        if (n < 0) throw java.io.EOFException("Stream ended after $offset/${buf.size} bytes")
-        offset += n
+    var off = 0
+    while (off < buf.size) {
+        val n = read(buf, off, buf.size - off)
+        if (n < 0) throw java.io.EOFException("Stream ended at $off/${buf.size}")
+        off += n
     }
 }
