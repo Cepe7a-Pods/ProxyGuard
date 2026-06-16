@@ -16,6 +16,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
@@ -30,7 +31,7 @@ class MainActivity : ComponentActivity() {
 
     private val notifPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { /* opional */ }
+    ) { }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -48,21 +49,37 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 fun MainScreen() {
-    val context       = LocalContext.current
-    val clipboard     = LocalClipboardManager.current
-    val bridgeSecret  = remember { BridgeSecret.getHex(context) }
+    val context      = LocalContext.current
+    val clipboard    = LocalClipboardManager.current
+    val bridgeSecret = remember { BridgeSecret.getHex(context) }
 
-    var serviceRunning  by remember { mutableStateOf(false) }
-    var copied          by remember { mutableStateOf(false) }
-    var statusText      by remember { mutableStateOf("") }
-    var poolSize        by remember { mutableIntStateOf(0) }
+    // ── Начальное состояние из SharedPreferences (переживает пересоздание Activity) ──
+    val prefs = remember { ProxyGuardService.prefs(context) }
 
-    // Принимаем broadcast от сервиса
+    var serviceRunning by remember {
+        mutableStateOf(prefs.getBoolean(ProxyGuardService.PREF_RUNNING, false))
+    }
+    var statusText by remember {
+        mutableStateOf(prefs.getString(ProxyGuardService.PREF_STATUS_TEXT, "") ?: "")
+    }
+    var poolSize by remember {
+        mutableIntStateOf(prefs.getInt(ProxyGuardService.PREF_POOL_SIZE, 0))
+    }
+    var isLoading by remember {
+        mutableStateOf(prefs.getBoolean(ProxyGuardService.PREF_IS_LOADING, false))
+    }
+    var copied by remember { mutableStateOf(false) }
+
+    // ── Broadcast от сервиса (real-time обновления) ──
     DisposableEffect(Unit) {
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(ctx: Context, intent: Intent) {
-                statusText = intent.getStringExtra(ProxyGuardService.EXTRA_STATUS_TEXT) ?: ""
-                poolSize   = intent.getIntExtra(ProxyGuardService.EXTRA_POOL_SIZE, 0)
+                statusText     = intent.getStringExtra(ProxyGuardService.EXTRA_STATUS_TEXT) ?: ""
+                poolSize       = intent.getIntExtra(ProxyGuardService.EXTRA_POOL_SIZE, 0)
+                isLoading      = intent.getBooleanExtra(ProxyGuardService.EXTRA_IS_LOADING, false)
+                serviceRunning = statusText.isNotEmpty()  // сервис остановлен → шлёт пустой статус
+                // Актуализируем prefs-флаг running если сервис остановился
+                if (statusText.isEmpty()) serviceRunning = false
             }
         }
         val filter = IntentFilter(ProxyGuardService.ACTION_STATUS)
@@ -86,25 +103,47 @@ fun MainScreen() {
         Text("🛡 ProxyGuard", style = MaterialTheme.typography.headlineLarge)
         Text(
             "MTProto прокси-менеджер для Telegram",
-            style    = MaterialTheme.typography.bodyMedium,
-            color    = MaterialTheme.colorScheme.onSurfaceVariant,
+            style     = MaterialTheme.typography.bodyMedium,
+            color     = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center,
         )
 
         HorizontalDivider()
 
-        // Статус (показываем только если сервис запущен)
-        AnimatedVisibility(visible = serviceRunning && statusText.isNotEmpty()) {
+        // ── Статус / Загрузка ──
+        AnimatedVisibility(visible = serviceRunning) {
             Card(
                 modifier = Modifier.fillMaxWidth(),
-                colors   = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.primaryContainer,
+                colors = CardDefaults.cardColors(
+                    containerColor = if (isLoading)
+                        MaterialTheme.colorScheme.surfaceVariant
+                    else
+                        MaterialTheme.colorScheme.primaryContainer,
                 ),
             ) {
-                Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text("Статус", style = MaterialTheme.typography.labelLarge)
-                    Text(statusText, style = MaterialTheme.typography.bodyMedium)
-                    if (poolSize > 0) {
+                Column(
+                    Modifier.padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text(
+                            if (isLoading) "Загрузка" else "Статус",
+                            style = MaterialTheme.typography.labelLarge,
+                        )
+                        if (isLoading) {
+                            CircularProgressIndicator(
+                                modifier  = Modifier.size(14.dp),
+                                strokeWidth = 2.dp,
+                            )
+                        }
+                    }
+                    if (statusText.isNotEmpty()) {
+                        Text(statusText, style = MaterialTheme.typography.bodyMedium)
+                    }
+                    if (!isLoading && poolSize > 0) {
                         Text(
                             "Прокси в пуле: $poolSize",
                             style = MaterialTheme.typography.bodySmall,
@@ -115,7 +154,7 @@ fun MainScreen() {
             }
         }
 
-        // Инструкция
+        // ── Инструкция ──
         Card(modifier = Modifier.fillMaxWidth()) {
             Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text("Настройка Telegram — один раз", style = MaterialTheme.typography.titleSmall)
@@ -125,7 +164,7 @@ fun MainScreen() {
             }
         }
 
-        // Bridge secret
+        // ── Bridge secret ──
         Card(
             modifier = Modifier.fillMaxWidth(),
             colors = CardDefaults.cardColors(
@@ -139,16 +178,13 @@ fun MainScreen() {
             ) {
                 Text("Секрет для Telegram:", style = MaterialTheme.typography.labelLarge)
                 Text(
-                    text = bridgeSecret,
+                    text       = bridgeSecret,
                     fontFamily = FontFamily.Monospace,
                     fontSize   = 12.sp,
                     textAlign  = TextAlign.Center,
                     modifier   = Modifier
                         .fillMaxWidth()
-                        .background(
-                            MaterialTheme.colorScheme.surface,
-                            RoundedCornerShape(6.dp),
-                        )
+                        .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(6.dp))
                         .padding(10.dp),
                 )
                 OutlinedButton(
@@ -165,35 +201,44 @@ fun MainScreen() {
 
         Spacer(Modifier.weight(1f))
 
-        // Кнопки
+        // ── Кнопки ──
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            // Кнопка Запуск/Стоп
             Button(
                 onClick = {
                     if (serviceRunning) {
                         ProxyGuardService.stop(context)
+                        serviceRunning = false
+                        statusText = ""
+                        poolSize = 0
+                        isLoading = false
                     } else {
                         ProxyGuardService.start(context)
+                        serviceRunning = true
+                        statusText = "Запуск..."
+                        isLoading = true
                     }
-                    serviceRunning = !serviceRunning
                 },
-                modifier = Modifier.weight(1f).height(52.dp),
-                colors = if (serviceRunning) {
+                modifier = Modifier
+                    .weight(1f)
+                    .height(52.dp),
+                colors = if (serviceRunning)
                     ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
-                } else {
-                    ButtonDefaults.buttonColors()
-                },
+                else
+                    ButtonDefaults.buttonColors(),
             ) {
                 Text(if (serviceRunning) "⏹ Стоп" else "▶ Запустить", fontSize = 16.sp)
             }
 
-            // Кнопка Обновить (только когда запущен)
             AnimatedVisibility(visible = serviceRunning) {
                 OutlinedButton(
-                    onClick = { ProxyGuardService.refresh(context) },
+                    onClick = {
+                        ProxyGuardService.refresh(context)
+                        statusText = "Обновление..."
+                        isLoading = true
+                    },
                     modifier = Modifier.height(52.dp),
                 ) {
                     Text("🔄", fontSize = 16.sp)
@@ -201,7 +246,7 @@ fun MainScreen() {
             }
         }
 
-        if (serviceRunning) {
+        AnimatedVisibility(visible = serviceRunning) {
             Text(
                 "Relay работает • 127.0.0.1:1080",
                 style = MaterialTheme.typography.bodySmall,
