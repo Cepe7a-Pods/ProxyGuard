@@ -15,6 +15,7 @@ class RelayConnection(
 ) {
 
     suspend fun handle() {
+        // 1. Читаем 64-байтовый nonce от Telegram
         val init = ByteArray(64)
         try {
             telegramSocket.getInputStream().readFully(init)
@@ -23,20 +24,22 @@ class RelayConnection(
             telegramSocket.close(); return
         }
 
+        // 2. Проверяем protocol tag
         val (protocolTag, bridgeCipher) = MtProtoObfuscation.fromClientInit(init, bridgeSecret)
         if (!protocolTag.contentEquals(MtProtoObfuscation.PADDED_INTERMEDIATE_TAG)) {
-            Log.w(TAG, "Unknown tag: ${protocolTag.toHex()}")
+            Log.w(TAG, "Unknown tag: ${protocolTag.toHex()}, drop")
             telegramSocket.close(); return
         }
-
         telegramSocket.soTimeout = 0
 
-        val proxy = proxyPool.getBest()
-        if (proxy == null) {
-            Log.e(TAG, "No proxies available")
+        // 3. Ждём прокси в пуле (на первом запуске пул ещё загружается)
+        //    Telegram держит соединение ~90 сек, так что ждём до 80 сек.
+        val proxy = waitForProxy() ?: run {
+            Log.e(TAG, "Pool empty after wait, closing")
             telegramSocket.close(); return
         }
 
+        // 4. Подключаемся к внешнему прокси
         val proxySocket = try {
             Socket().apply {
                 tcpNoDelay = true
@@ -49,6 +52,7 @@ class RelayConnection(
             telegramSocket.close(); return
         }
 
+        // 5. Отправляем наш nonce внешнему прокси
         val (initToSend, proxyCipher) = MtProtoObfuscation.generateForProxy(proxy.secretBytes)
         try {
             proxySocket.getOutputStream().write(initToSend)
@@ -58,11 +62,9 @@ class RelayConnection(
             telegramSocket.close(); proxySocket.close(); return
         }
 
-        Log.d(TAG, "Relay up: Telegram ↔ ${proxy.server}:${proxy.port}")
+        Log.i(TAG, "Relay up: Telegram ↔ ${proxy.server}:${proxy.port}")
 
-        // ВАЖНО: блокирующий read() не прерывается отменой корутины.
-        // Единственный способ разбудить заблокированный поток — закрыть сокет.
-        // Поэтому в invokeOnCompletion закрываем ОБА сокета, а не только отменяем job.
+        // 6. Двунаправленный relay
         try {
             coroutineScope {
                 val t2p = launch(Dispatchers.IO) {
@@ -75,9 +77,7 @@ class RelayConnection(
                         bridgeCipher.encrypt(proxyCipher.decrypt(chunk))
                     }
                 }
-
-                // Когда одно направление упало — закрываем сокеты.
-                // Это прерывает блокирующий read() в другом направлении.
+                // Если одно направление упало — закрываем сокеты, это разблокирует read() в другом
                 t2p.invokeOnCompletion {
                     p2t.cancel()
                     runCatching { telegramSocket.close() }
@@ -90,7 +90,6 @@ class RelayConnection(
                 }
             }
         } catch (_: CancellationException) {
-            // нормальное завершение
         } catch (e: Exception) {
             Log.w(TAG, "Relay error: ${e.message}")
             proxyPool.markFailed(proxy)
@@ -101,11 +100,16 @@ class RelayConnection(
         }
     }
 
-    private fun pipe(
-        from: InputStream,
-        to: OutputStream,
-        transform: (ByteArray) -> ByteArray,
-    ) {
+    /** Ждём пока пул заполнится. Возвращает null если так и не дождались. */
+    private suspend fun waitForProxy() = withTimeoutOrNull(POOL_WAIT_TIMEOUT_MS) {
+        while (proxyPool.isEmpty()) {
+            Log.d(TAG, "Pool empty, waiting for proxies to load...")
+            delay(POOL_POLL_INTERVAL_MS)
+        }
+        proxyPool.getBest()
+    }
+
+    private fun pipe(from: InputStream, to: OutputStream, transform: (ByteArray) -> ByteArray) {
         val buf = ByteArray(BUFFER_SIZE)
         try {
             while (true) {
@@ -114,15 +118,17 @@ class RelayConnection(
                 to.write(transform(buf.copyOfRange(0, n)))
                 to.flush()
             }
-        } catch (_: Exception) { /* сокет закрыт — штатный выход */ }
+        } catch (_: Exception) { }
     }
 
     private fun ByteArray.toHex() = joinToString("") { "%02x".format(it) }
 
     companion object {
-        private const val TAG           = "RelayConnection"
-        private const val CONNECT_TIMEOUT = 10_000
-        private const val BUFFER_SIZE   = 8192
+        private const val TAG                 = "RelayConnection"
+        private const val CONNECT_TIMEOUT     = 10_000
+        private const val BUFFER_SIZE         = 8192
+        private const val POOL_WAIT_TIMEOUT_MS = 80_000L   // ждём до 80 сек
+        private const val POOL_POLL_INTERVAL_MS = 2_000L   // проверяем каждые 2 сек
     }
 }
 

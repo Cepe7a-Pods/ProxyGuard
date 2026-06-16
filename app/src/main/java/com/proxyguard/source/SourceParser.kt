@@ -9,16 +9,17 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import java.util.Base64
 import java.util.concurrent.TimeUnit
 
 /**
- * Парсит списки MTProto прокси из различных источников.
+ * Парсит списки MTProto прокси из GitHub-источников.
  *
- * Поддерживаемые форматы:
- *   • tg://proxy?server=...&port=...&secret=...
- *   • https://t.me/proxy?server=...&port=...&secret=...
- *   • IP:PORT:SECRET  (raw text)
- *   • JSON-массивы   (GitHub-репозитории)
+ * Поддерживаемые форматы секрета:
+ *   • hex dd...  (34+ символов, dd-prefix = simple MTProto с padding)
+ *   • base64 3Q... (= hex dd..., base64-кодировка того же)
+ *
+ * ee-prefix (FakeTLS) — не поддерживается relay'ем, пропускается.
  */
 class SourceParser {
 
@@ -27,40 +28,25 @@ class SourceParser {
         .readTimeout(15, TimeUnit.SECONDS)
         .build()
 
-    data class ProxySource(
-        val name: String,
-        val url: String,
-        val type: SourceType = SourceType.AUTO,
-    )
-
-    enum class SourceType { AUTO, RAW_TEXT, JSON }
+    data class ProxySource(val name: String, val url: String)
 
     /**
-     * Публичные GitHub-источники MTProto прокси.
-     * Можно добавлять свои.
+     * Проверенные рабочие источники MTProto dd-прокси.
      */
     private val sources = listOf(
         ProxySource(
-            name = "MTPoroxy (Black-Catt)",
-            url  = "https://raw.githubusercontent.com/Black-Catt/MTPoroxy/main/MTP.txt",
+            name = "SoliSpirit MTProto",
+            url  = "https://raw.githubusercontent.com/SoliSpirit/mtproto/master/all_proxies.txt",
         ),
         ProxySource(
-            name = "MTProto list 1",
-            url  = "https://raw.githubusercontent.com/hookzof/socks5_list/master/tg/mtproto.txt",
-        ),
-        ProxySource(
-            name = "MTProto list 2",
-            url  = "https://raw.githubusercontent.com/manuGMG/proxy-365/main/HTTPS.txt",
-        ),
-        ProxySource(
-            name = "TgProxy collection",
-            url  = "https://raw.githubusercontent.com/soroushmirzaei/telegram-proxies-collector/main/proxies",
+            name = "ALIILAPRO MTProtoProxy",
+            url  = "https://raw.githubusercontent.com/ALIILAPRO/MTProtoProxy/main/mtproto.txt",
         ),
     )
 
     /**
-     * Загружает и парсит все источники.
-     * @return дедуплицированный список прокси (только dd-prefix, без ee пока)
+     * Загружает и парсит все источники параллельно.
+     * @return дедуплицированный список dd-прокси
      */
     suspend fun fetchAll(
         onSourceDone: ((name: String, found: Int) -> Unit)? = null,
@@ -80,75 +66,62 @@ class SourceParser {
             }
         }
         val all = jobs.awaitAll().flatten()
-        deduplicate(all).also { Log.i(TAG, "Total unique proxies: ${it.size}") }
+        deduplicate(all).also { Log.i(TAG, "Total unique dd-proxies: ${it.size}") }
     }
 
     private fun fetchSource(source: ProxySource): List<MtProtoProxy> {
         val request = Request.Builder().url(source.url).build()
         val body = client.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) return emptyList()
+            if (!response.isSuccessful) {
+                Log.w(TAG, "${source.name} HTTP ${response.code}")
+                return emptyList()
+            }
             response.body?.string() ?: return emptyList()
         }
         return parseText(body, source.name)
     }
 
     /**
-     * Парсит сырой текст — ищет все упоминания tg://proxy или t.me/proxy
-     * и raw-формат SERVER:PORT:SECRET.
+     * Ищет в тексте все ссылки t.me/proxy и tg://proxy.
+     * Принимает ТОЛЬКО dd-prefix (секрет начинается на "dd" в hex
+     * или "3Q" в base64, что равнозначно байту 0xDD).
      */
     fun parseText(text: String, sourceTag: String = ""): List<MtProtoProxy> {
         val result = mutableListOf<MtProtoProxy>()
-
-        // Ищем tg://proxy?... и https://t.me/proxy?...
-        val tgLinkPattern = Regex(
+        val pattern = Regex(
             """(?:tg://proxy|https?://t\.me/proxy)\?([^\s"'<>]+)""",
             RegexOption.IGNORE_CASE,
         )
-        tgLinkPattern.findAll(text).forEach { match ->
-            parseTgLink("tg://proxy?${match.groupValues[1]}", sourceTag)?.let { result.add(it) }
+        pattern.findAll(text).forEach { match ->
+            parseTgLink("tg://proxy?${match.groupValues[1]}", sourceTag)
+                ?.let { result.add(it) }
         }
-
-        // Ищем raw-формат: SERVER PORT SECRET или SERVER:PORT:SECRET
-        if (result.isEmpty()) {
-            val rawPattern = Regex(
-                """(\d{1,3}(?:\.\d{1,3}){3})[:\s]+(\d{2,5})[:\s]+((?:dd|ee)[0-9a-fA-F]{32,64})""",
-                RegexOption.IGNORE_CASE,
-            )
-            rawPattern.findAll(text).forEach { match ->
-                runCatching {
-                    result.add(MtProtoProxy(
-                        server  = match.groupValues[1],
-                        port    = match.groupValues[2].toInt(),
-                        secret  = match.groupValues[3].lowercase(),
-                        comment = sourceTag,
-                    ))
-                }
-            }
-        }
-
         return result
     }
 
     /**
-     * Парсит ссылку формата tg://proxy?server=...&port=...&secret=...
+     * Парсит ссылку tg://proxy?server=...&port=...&secret=...
+     * Принимает секреты в hex (dd...) и base64 (3Q...).
+     * ee-FakeTLS (hex ee... или base64 7g...) — отклоняются.
      */
     fun parseTgLink(url: String, sourceTag: String = ""): MtProtoProxy? {
         return try {
-            // Uri.parse не работает с tg:// из коробки — заменяем схему
             val normalized = url.replace("tg://proxy", "https://tg.proxy")
             val uri = Uri.parse(normalized)
-            val server = uri.getQueryParameter("server") ?: return null
-            val port   = uri.getQueryParameter("port")?.toIntOrNull() ?: return null
-            val secret = uri.getQueryParameter("secret") ?: return null
+            val server  = uri.getQueryParameter("server")?.trim('.') ?: return null
+            val port    = uri.getQueryParameter("port")?.toIntOrNull() ?: return null
+            val rawSecret = uri.getQueryParameter("secret") ?: return null
 
-            // Принимаем только dd-prefix (ee — FakeTLS, пока не поддерживаем)
-            if (!secret.startsWith("dd", ignoreCase = true) &&
-                !secret.startsWith("ee", ignoreCase = true)) return null
+            // Нормализуем секрет в hex
+            val hexSecret = normalizeSecret(rawSecret) ?: return null
+
+            // Принимаем только dd-prefix
+            if (!hexSecret.startsWith("dd")) return null
 
             MtProtoProxy(
                 server  = server,
                 port    = port,
-                secret  = secret.lowercase(),
+                secret  = hexSecret,
                 comment = sourceTag,
             )
         } catch (e: Exception) {
@@ -156,11 +129,36 @@ class SourceParser {
         }
     }
 
+    /**
+     * Приводит секрет к нижнему hex-регистру.
+     * Если секрет — base64 (содержит / + = или не hex-символы) → декодируем.
+     * Возвращает null если секрет невалиден.
+     */
+    private fun normalizeSecret(raw: String): String? {
+        // URL-decode на случай %3D и т.п.
+        val s = try {
+            java.net.URLDecoder.decode(raw, "UTF-8")
+        } catch (_: Exception) { raw }
+
+        return if (isHex(s)) {
+            s.lowercase()
+        } else {
+            // Пробуем base64
+            runCatching {
+                val bytes = Base64.getDecoder().decode(
+                    s.replace('-', '+').replace('_', '/')   // URL-safe base64
+                )
+                bytes.joinToString("") { "%02x".format(it) }
+            }.getOrNull()
+        }
+    }
+
+    private fun isHex(s: String) = s.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }
+
     private fun deduplicate(proxies: List<MtProtoProxy>): List<MtProtoProxy> {
         val seen = mutableSetOf<String>()
-        return proxies.filter { proxy ->
-            val key = "${proxy.server}:${proxy.port}:${proxy.secret}"
-            seen.add(key)
+        return proxies.filter { p ->
+            seen.add("${p.server}:${p.port}:${p.secret}")
         }
     }
 
