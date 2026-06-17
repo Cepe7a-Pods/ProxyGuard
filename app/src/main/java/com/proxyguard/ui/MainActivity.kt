@@ -12,11 +12,12 @@ import androidx.compose.animation.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.List
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
@@ -31,30 +32,41 @@ class MainActivity : ComponentActivity() {
 
     private val notifPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { }
+    ) {}
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
-                != PackageManager.PERMISSION_GRANTED) {
-                notifPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
-            }
+                != PackageManager.PERMISSION_GRANTED
+            ) notifPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
         setContent {
-            MaterialTheme { Surface(Modifier.fillMaxSize()) { MainScreen() } }
+            MaterialTheme {
+                Surface(Modifier.fillMaxSize()) {
+                    AppNavigation()
+                }
+            }
         }
     }
 }
 
 @Composable
-fun MainScreen() {
-    val context      = LocalContext.current
-    val clipboard    = LocalClipboardManager.current
-    val bridgeSecret = remember { BridgeSecret.getHex(context) }
+fun AppNavigation() {
+    var screen by remember { mutableStateOf("main") }   // "main" | "sources"
 
-    // ── Начальное состояние из SharedPreferences (переживает пересоздание Activity) ──
-    val prefs = remember { ProxyGuardService.prefs(context) }
+    when (screen) {
+        "main"    -> MainScreen(onOpenSources = { screen = "sources" })
+        "sources" -> SourcesScreen(onBack = { screen = "main" })
+    }
+}
+
+@Composable
+fun MainScreen(onOpenSources: () -> Unit) {
+    val context   = LocalContext.current
+    val clipboard = LocalClipboardManager.current
+    val secret    = remember { BridgeSecret.getHex(context) }
+    val prefs     = remember { ProxyGuardService.prefs(context) }
 
     var serviceRunning by remember {
         mutableStateOf(prefs.getBoolean(ProxyGuardService.PREF_RUNNING, false))
@@ -70,37 +82,44 @@ fun MainScreen() {
     }
     var copied by remember { mutableStateOf(false) }
 
-    // ── Broadcast от сервиса (real-time обновления) ──
     DisposableEffect(Unit) {
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(ctx: Context, intent: Intent) {
-                statusText     = intent.getStringExtra(ProxyGuardService.EXTRA_STATUS_TEXT) ?: ""
+                val text = intent.getStringExtra(ProxyGuardService.EXTRA_STATUS_TEXT) ?: ""
+                statusText     = text
                 poolSize       = intent.getIntExtra(ProxyGuardService.EXTRA_POOL_SIZE, 0)
                 isLoading      = intent.getBooleanExtra(ProxyGuardService.EXTRA_IS_LOADING, false)
-                serviceRunning = statusText.isNotEmpty()  // сервис остановлен → шлёт пустой статус
-                // Актуализируем prefs-флаг running если сервис остановился
-                if (statusText.isEmpty()) serviceRunning = false
+                if (text.isEmpty()) serviceRunning = false
             }
         }
         val filter = IntentFilter(ProxyGuardService.ACTION_STATUS)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
         } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
             context.registerReceiver(receiver, filter)
         }
         onDispose { context.unregisterReceiver(receiver) }
     }
 
     Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(horizontal = 20.dp, vertical = 16.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(16.dp),
+        modifier                = Modifier.fillMaxSize().padding(horizontal = 20.dp, vertical = 16.dp),
+        horizontalAlignment     = Alignment.CenterHorizontally,
+        verticalArrangement     = Arrangement.spacedBy(16.dp),
     ) {
         Spacer(Modifier.height(8.dp))
 
-        Text("🛡 ProxyGuard", style = MaterialTheme.typography.headlineLarge)
+        // Заголовок + кнопка "Источники"
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Spacer(Modifier.weight(1f))
+            Text("🛡 ProxyGuard", style = MaterialTheme.typography.headlineLarge)
+            Spacer(Modifier.weight(1f))
+            IconButton(onClick = onOpenSources) {
+                Icon(Icons.Default.List, contentDescription = "Источники",
+                    tint = MaterialTheme.colorScheme.primary)
+            }
+        }
+
         Text(
             "MTProto прокси-менеджер для Telegram",
             style     = MaterialTheme.typography.bodyMedium,
@@ -110,7 +129,7 @@ fun MainScreen() {
 
         HorizontalDivider()
 
-        // ── Статус / Загрузка ──
+        // Статус-карточка
         AnimatedVisibility(visible = serviceRunning) {
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -121,23 +140,17 @@ fun MainScreen() {
                         MaterialTheme.colorScheme.primaryContainer,
                 ),
             ) {
-                Column(
-                    Modifier.padding(14.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
+                Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment      = Alignment.CenterVertically,
+                        horizontalArrangement  = Arrangement.spacedBy(8.dp),
                     ) {
                         Text(
                             if (isLoading) "Загрузка" else "Статус",
                             style = MaterialTheme.typography.labelLarge,
                         )
                         if (isLoading) {
-                            CircularProgressIndicator(
-                                modifier  = Modifier.size(14.dp),
-                                strokeWidth = 2.dp,
-                            )
+                            CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
                         }
                     }
                     if (statusText.isNotEmpty()) {
@@ -154,22 +167,22 @@ fun MainScreen() {
             }
         }
 
-        // ── Инструкция ──
+        // Инструкция
         Card(modifier = Modifier.fillMaxWidth()) {
             Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text("Настройка Telegram — один раз", style = MaterialTheme.typography.titleSmall)
+                Text("Настройка Telegram — один раз",
+                    style = MaterialTheme.typography.titleSmall)
                 Text("1. Настройки → Данные → Прокси → Добавить", fontSize = 13.sp)
                 Text("2. Тип: MTProto  •  Адрес: 127.0.0.1  •  Порт: 1080", fontSize = 13.sp)
                 Text("3. Секрет — скопируй ниже и вставь", fontSize = 13.sp)
             }
         }
 
-        // ── Bridge secret ──
+        // Bridge secret
         Card(
             modifier = Modifier.fillMaxWidth(),
             colors = CardDefaults.cardColors(
-                containerColor = MaterialTheme.colorScheme.secondaryContainer,
-            ),
+                containerColor = MaterialTheme.colorScheme.secondaryContainer),
         ) {
             Column(
                 Modifier.padding(14.dp),
@@ -178,7 +191,7 @@ fun MainScreen() {
             ) {
                 Text("Секрет для Telegram:", style = MaterialTheme.typography.labelLarge)
                 Text(
-                    text       = bridgeSecret,
+                    text       = secret,
                     fontFamily = FontFamily.Monospace,
                     fontSize   = 12.sp,
                     textAlign  = TextAlign.Center,
@@ -188,10 +201,7 @@ fun MainScreen() {
                         .padding(10.dp),
                 )
                 OutlinedButton(
-                    onClick = {
-                        clipboard.setText(AnnotatedString(bridgeSecret))
-                        copied = true
-                    },
+                    onClick  = { clipboard.setText(AnnotatedString(secret)); copied = true },
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Text(if (copied) "✓ Скопировано" else "Скопировать")
@@ -201,30 +211,20 @@ fun MainScreen() {
 
         Spacer(Modifier.weight(1f))
 
-        // ── Кнопки ──
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
+        // Кнопки управления
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             Button(
                 onClick = {
                     if (serviceRunning) {
                         ProxyGuardService.stop(context)
-                        serviceRunning = false
-                        statusText = ""
-                        poolSize = 0
-                        isLoading = false
+                        serviceRunning = false; statusText = ""; poolSize = 0; isLoading = false
                     } else {
                         ProxyGuardService.start(context)
-                        serviceRunning = true
-                        statusText = "Запуск..."
-                        isLoading = true
+                        serviceRunning = true; statusText = "Запуск..."; isLoading = true
                     }
                 },
-                modifier = Modifier
-                    .weight(1f)
-                    .height(52.dp),
-                colors = if (serviceRunning)
+                modifier = Modifier.weight(1f).height(52.dp),
+                colors   = if (serviceRunning)
                     ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
                 else
                     ButtonDefaults.buttonColors(),
@@ -234,10 +234,9 @@ fun MainScreen() {
 
             AnimatedVisibility(visible = serviceRunning) {
                 OutlinedButton(
-                    onClick = {
+                    onClick  = {
                         ProxyGuardService.refresh(context)
-                        statusText = "Обновление..."
-                        isLoading = true
+                        statusText = "Обновление..."; isLoading = true
                     },
                     modifier = Modifier.height(52.dp),
                 ) {

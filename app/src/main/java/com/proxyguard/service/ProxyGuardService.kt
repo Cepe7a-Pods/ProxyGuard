@@ -16,6 +16,7 @@ import com.proxyguard.proxy.ProxyValidator
 import com.proxyguard.relay.BridgeSecret
 import com.proxyguard.relay.LocalRelayServer
 import com.proxyguard.source.SourceParser
+import com.proxyguard.source.SourceRepository
 import com.proxyguard.ui.MainActivity
 import kotlinx.coroutines.*
 
@@ -25,6 +26,7 @@ class ProxyGuardService : LifecycleService() {
     private val proxyPool    = ProxyPool()
     private val validator    = ProxyValidator()
     private val sourceParser = SourceParser()
+    private lateinit var sourceRepo: SourceRepository
     private lateinit var repository: ProxyRepository
     private lateinit var prefs: SharedPreferences
 
@@ -74,6 +76,7 @@ class ProxyGuardService : LifecycleService() {
         prefs.edit().putBoolean(PREF_RUNNING, true).apply()
 
         repository = ProxyRepository(this)
+        sourceRepo = SourceRepository(this)
         val bridgeSecret = BridgeSecret.getBytes(this)
         relayServer = LocalRelayServer(PORT, bridgeSecret, proxyPool)
         relayServer.start()
@@ -109,7 +112,7 @@ class ProxyGuardService : LifecycleService() {
         try {
             persistAndBroadcast("Загрузка источников...", proxyPool.size(), isLoading = true)
 
-            val all = sourceParser.fetchAll()
+            val all = sourceParser.fetchAll(sourceRepo.loadEnabled())
             if (all.isEmpty()) {
                 val text = "⚠ Источники недоступны. Повтор через 15 мин."
                 persistAndBroadcast(text, proxyPool.size(), isLoading = false)
