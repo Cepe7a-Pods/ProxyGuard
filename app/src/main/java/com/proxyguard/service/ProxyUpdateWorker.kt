@@ -27,7 +27,7 @@ class ProxyUpdateWorker(
 
         return try {
             val sourceParser = SourceParser()
-            val validator    = ProxyValidator(connectTimeoutMs = 6_000, readTimeoutMs = 6_000)
+            val validator    = ProxyValidator(connectTimeoutMs = 6_000, ddSilenceMs = 2_000, eeResponseMs = 6_000)
             val repository   = ProxyRepository(context)
 
             val proxies = sourceParser.fetchAll()
