@@ -8,6 +8,7 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
+import javax.net.ssl.SSLSocket
 
 class RelayConnection(
     private val telegramSocket: Socket,
@@ -25,79 +26,52 @@ class RelayConnection(
             telegramSocket.close(); return
         }
 
-        // 2. Проверяем bridge secret и получаем шифр для Telegram-стороны
+        // 2. Проверяем bridge secret
         val (protocolTag, bridgeCipher) = MtProtoObfuscation.fromClientInit(init, bridgeSecret)
         if (!protocolTag.contentEquals(MtProtoObfuscation.PADDED_INTERMEDIATE_TAG)) {
-            Log.w(TAG, "Unknown protocol tag: ${protocolTag.toHex()}"); telegramSocket.close(); return
+            Log.w(TAG, "Unknown protocol tag: ${protocolTag.toHex()}")
+            telegramSocket.close(); return
         }
         telegramSocket.soTimeout = 0
 
-        // 3. Ждём прокси в пуле (при первом запуске загружаются ~1 мин)
+        // 3. Ждём прокси в пуле
         val proxy = waitForProxy() ?: run {
-            Log.e(TAG, "Pool empty after wait"); telegramSocket.close(); return
+            Log.e(TAG, "Pool empty after ${POOL_WAIT_MS}ms"); telegramSocket.close(); return
         }
 
         // 4. Подключаемся к внешнему прокси
-        val proxySocket = try {
-            Socket().apply {
-                tcpNoDelay = true
-                connect(InetSocketAddress(proxy.server, proxy.port), CONNECT_TIMEOUT)
-                soTimeout = 0
-            }
+        val proxySocket: Socket = try {
+            connectToProxy(proxy)
         } catch (e: Exception) {
-            Log.w(TAG, "Connect to ${proxy.server}:${proxy.port} failed: ${e.message}")
+            Log.w(TAG, "${proxy.server}: connect failed — ${e.message}")
             proxyPool.markFailed(proxy); telegramSocket.close(); return
         }
 
-        // 5. Рукопожатие с внешним прокси (dd или ee)
-        val proxyCipher = try {
-            handshakeWithProxy(proxySocket, proxy)
+        // 5. MTProto рукопожатие с прокси (отправляем наш nonce)
+        val proxyCipher: MtProtoObfuscation = try {
+            val (initToSend, cipher) = MtProtoObfuscation.generateForProxy(proxy.secretKey)
+            proxySocket.getOutputStream().write(initToSend)
+            proxySocket.getOutputStream().flush()
+            cipher
         } catch (e: Exception) {
-            Log.w(TAG, "Proxy handshake failed: ${e.message}")
-            proxyPool.markFailed(proxy); telegramSocket.close(); proxySocket.close(); return
+            Log.w(TAG, "${proxy.server}: nonce send failed — ${e.message}")
+            proxyPool.markFailed(proxy)
+            telegramSocket.close(); proxySocket.close(); return
         }
 
-        if (proxyCipher == null) {
-            Log.w(TAG, "Handshake returned null cipher")
-            proxyPool.markFailed(proxy); telegramSocket.close(); proxySocket.close(); return
-        }
+        Log.i(TAG, "Relay up: ${proxy.server}:${proxy.port} (${if (proxy.isFakeTls) "TLS" else "dd"})")
 
-        Log.i(TAG, "Relay up: Telegram ↔ ${proxy.server}:${proxy.port} (${if (proxy.isFakeTls) "ee/FakeTLS" else "dd"})")
-
-        // 6. Двунаправленный relay
-        val isFakeTls = proxy.isFakeTls
+        // 6. Двунаправленный relay — одинаковый для dd и ee (TLS прозрачен)
         try {
             coroutineScope {
-                // Telegram → Proxy
                 val t2p = launch(Dispatchers.IO) {
-                    if (isFakeTls) {
-                        pipeWithTlsWrap(
-                            from      = telegramSocket.getInputStream(),
-                            to        = proxySocket.getOutputStream(),
-                            transform = { chunk -> proxyCipher.encrypt(bridgeCipher.decrypt(chunk)) },
-                        )
-                    } else {
-                        pipe(
-                            from      = telegramSocket.getInputStream(),
-                            to        = proxySocket.getOutputStream(),
-                            transform = { chunk -> proxyCipher.encrypt(bridgeCipher.decrypt(chunk)) },
-                        )
+                    pipe(telegramSocket.getInputStream(), proxySocket.getOutputStream()) { chunk ->
+                        proxyCipher.encrypt(bridgeCipher.decrypt(chunk))
                     }
                 }
-                // Proxy → Telegram
                 val p2t = launch(Dispatchers.IO) {
-                    if (isFakeTls) {
-                        pipeWithTlsRead(
-                            from      = proxySocket.getInputStream(),
-                            to        = telegramSocket.getOutputStream(),
-                            transform = { chunk -> bridgeCipher.encrypt(proxyCipher.decrypt(chunk)) },
-                        )
-                    } else {
-                        pipe(
-                            from      = proxySocket.getInputStream(),
-                            to        = telegramSocket.getOutputStream(),
-                            transform = { chunk -> bridgeCipher.encrypt(proxyCipher.decrypt(chunk)) },
-                        )
+                    pipe(proxySocket.getInputStream(), telegramSocket.getOutputStream()) { chunk ->
+                        bridgeCipher.encrypt(proxyCipher.decrypt(chunk))
                     }
                 }
                 t2p.invokeOnCompletion {
@@ -122,51 +96,26 @@ class RelayConnection(
     }
 
     /**
-     * Рукопожатие с внешним прокси.
-     * dd: отправляем 64-байтовый nonce напрямую.
-     * ee: FakeTLS ClientHello → ServerHello → nonce в TLS AppData.
-     * Возвращает MtProtoObfuscation для проксийной стороны (или null при ошибке).
+     * dd: обычный TCP Socket
+     * ee: SSLSocket с реальным TLS 1.3 (MTProto идёт ВНУТРИ TLS сессии)
      */
-    private fun handshakeWithProxy(
-        proxySocket: Socket,
-        proxy: MtProtoProxy,
-    ): MtProtoObfuscation? {
-        val (initToSend, proxyCipher) = MtProtoObfuscation.generateForProxy(proxy.secretKey)
-
+    private fun connectToProxy(proxy: MtProtoProxy): Socket {
         return if (!proxy.isFakeTls) {
-            // ── dd: просто шлём nonce ──────────────────────────────────────
-            proxySocket.getOutputStream().write(initToSend)
-            proxySocket.getOutputStream().flush()
-            proxyCipher
-
-        } else {
-            // ── ee: FakeTLS рукопожатие ──────────────────────────────────
-            val domain = proxy.tlsDomain ?: proxy.server
-
-            // a) Отправляем ClientHello
-            val clientHello = FakeTls.buildClientHello(proxy.secretKey, domain)
-            proxySocket.getOutputStream().write(clientHello)
-            proxySocket.getOutputStream().flush()
-
-            // b) Читаем ServerHello + ChangeCipherSpec + первый AppData
-            proxySocket.soTimeout = 8_000
-            val ok = FakeTls.readServerHandshake(proxySocket.getInputStream())
-            proxySocket.soTimeout = 0
-
-            if (!ok) {
-                Log.w(TAG, "FakeTLS: no ServerHello from ${proxy.server}")
-                return null
+            Socket().apply {
+                tcpNoDelay = true
+                connect(InetSocketAddress(proxy.server, proxy.port), CONNECT_TIMEOUT)
+                soTimeout = 0
             }
-
-            // c) Отправляем MTProto nonce обёрнутый в TLS AppData
-            proxySocket.getOutputStream().write(FakeTls.wrap(initToSend))
-            proxySocket.getOutputStream().flush()
-
-            proxyCipher
+        } else {
+            val domain = proxy.tlsDomain ?: proxy.server
+            val ssl = ProxyTls.connect(proxy.server, proxy.port, domain, CONNECT_TIMEOUT)
+            ssl.soTimeout = TLS_HANDSHAKE_TIMEOUT
+            ssl.startHandshake()
+            ssl.soTimeout = 0
+            ssl.tcpNoDelay = true
+            ssl
         }
     }
-
-    // ── Pipe: dd (raw bytes) ────────────────────────────────────────────
 
     private fun pipe(from: InputStream, to: OutputStream, transform: (ByteArray) -> ByteArray) {
         val buf = ByteArray(BUFFER_SIZE)
@@ -180,51 +129,20 @@ class RelayConnection(
         } catch (_: Exception) { }
     }
 
-    // ── Pipe: ee (TLS Application Data) ────────────────────────────────
-
-    /** Читаем raw от Telegram, шлём в TLS AppData записях к прокси */
-    private fun pipeWithTlsWrap(from: InputStream, to: OutputStream, transform: (ByteArray) -> ByteArray) {
-        val buf = ByteArray(BUFFER_SIZE)
-        try {
-            while (true) {
-                val n = from.read(buf)
-                if (n < 0) break
-                val transformed = transform(buf.copyOfRange(0, n))
-                to.write(FakeTls.wrap(transformed))
-                to.flush()
-            }
-        } catch (_: Exception) { }
-    }
-
-    /** Читаем TLS AppData записи от прокси, шлём raw к Telegram */
-    private fun pipeWithTlsRead(from: InputStream, to: OutputStream, transform: (ByteArray) -> ByteArray) {
-        try {
-            while (true) {
-                val payload = FakeTls.readAppData(from) ?: break
-                to.write(transform(payload))
-                to.flush()
-            }
-        } catch (_: Exception) { }
-    }
-
-    // ── Утилиты ──────────────────────────────────────────────────────────
-
     private suspend fun waitForProxy() = withTimeoutOrNull(POOL_WAIT_MS) {
-        while (proxyPool.isEmpty()) {
-            Log.d(TAG, "Pool empty, waiting...")
-            delay(POOL_POLL_MS)
-        }
+        while (proxyPool.isEmpty()) { delay(POOL_POLL_MS) }
         proxyPool.getBest()
     }
 
     private fun ByteArray.toHex() = joinToString("") { "%02x".format(it) }
 
     companion object {
-        private const val TAG              = "RelayConnection"
-        private const val CONNECT_TIMEOUT  = 10_000
-        private const val BUFFER_SIZE      = 8_192
-        private const val POOL_WAIT_MS     = 80_000L
-        private const val POOL_POLL_MS     = 2_000L
+        private const val TAG                  = "RelayConnection"
+        private const val CONNECT_TIMEOUT      = 10_000
+        private const val TLS_HANDSHAKE_TIMEOUT = 8_000
+        private const val BUFFER_SIZE          = 8_192
+        private const val POOL_WAIT_MS         = 80_000L
+        private const val POOL_POLL_MS         = 2_000L
     }
 }
 

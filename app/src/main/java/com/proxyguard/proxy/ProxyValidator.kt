@@ -1,109 +1,97 @@
 package com.proxyguard.proxy
 
 import android.util.Log
-import com.proxyguard.relay.FakeTls
 import com.proxyguard.relay.MtProtoObfuscation
+import com.proxyguard.relay.ProxyTls
 import kotlinx.coroutines.*
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.SocketTimeoutException
 
 /**
- * Валидирует MTProto прокси — и dd (simple), и ee (FakeTLS).
+ * Валидирует MTProto прокси.
  *
- * dd-логика: send init → ждём 1.5 сек
- *   • SocketTimeoutException = соединение открыто, прокси молчит → ПРАВИЛЬНО (dd не отвечает сразу)
- *   • read() == -1 = сервер закрыл соединение → не MTProto прокси
- *   • получили байт сразу = HTTP/TLS banner → не MTProto прокси
+ * dd: TCP → send nonce → ждём молчания
+ *   timeout (тишина) = прокси ждёт данных = ✓ настоящий MTProto
+ *   read() == -1 = сервер закрыл = ✗
  *
- * ee-логика: send ClientHello → ждём ServerHello
- *   • получили TLS Handshake record (0x16) → ПРАВИЛЬНО (сервер ответил)
- *   • timeout / закрытие → не FakeTLS прокси
+ * ee: TLS handshake → send nonce → ждём молчания
+ *   То же, но поверх реального TLS 1.3.
+ *   TLS handshake не завершился = ✗ не наш прокси
  */
 class ProxyValidator(
     private val connectTimeoutMs: Int = 5_000,
-    private val ddSilenceMs: Int      = 1_500,   // dd: ждём что прокси НЕ ответит
-    private val eeResponseMs: Int     = 4_000,   // ee: ждём ServerHello
+    private val ddSilenceMs: Int      = 1_500,
+    private val eeResponseMs: Int     = 6_000,
 ) {
 
     suspend fun validate(proxy: MtProtoProxy): Long? = withContext(Dispatchers.IO) {
-        if (proxy.isFakeTls) validateFakeTls(proxy) else validateDd(proxy)
+        if (proxy.isFakeTls) validateTls(proxy) else validateDd(proxy)
     }
 
-    // ── dd (random-padded) ────────────────────────────────────────────────
+    // ── dd (plain TCP + MTProto nonce) ───────────────────────────────────
 
-    private fun validateDd(proxy: MtProtoProxy): Long? {
-        return try {
-            val (initToSend, _) = MtProtoObfuscation.generateForProxy(proxy.secretKey)
-            Socket().use { sock ->
-                val t0 = System.currentTimeMillis()
-                sock.connect(InetSocketAddress(proxy.server, proxy.port), connectTimeoutMs)
-                val ping = System.currentTimeMillis() - t0
-                sock.tcpNoDelay = true
-                sock.getOutputStream().write(initToSend)
-                sock.getOutputStream().flush()
-                sock.soTimeout = ddSilenceMs
-                return@use try {
-                    val b = sock.getInputStream().read()
-                    // Сервер что-то прислал сразу → HTTP/TLS banner, не MTProto
-                    Log.d(TAG, "dd ${proxy.server}: got immediate byte=$b — not MTProto")
-                    null
-                } catch (_: SocketTimeoutException) {
-                    // Молчание = соединение живо, прокси ждёт данных → ✓ MTProto
-                    Log.d(TAG, "dd ${proxy.server}: silent ✓ ping=${ping}ms")
-                    ping
-                }
+    private fun validateDd(proxy: MtProtoProxy): Long? = try {
+        val (initToSend, _) = MtProtoObfuscation.generateForProxy(proxy.secretKey)
+        Socket().use { sock ->
+            val t0 = System.currentTimeMillis()
+            sock.connect(InetSocketAddress(proxy.server, proxy.port), connectTimeoutMs)
+            val ping = System.currentTimeMillis() - t0
+            sock.tcpNoDelay = true
+            sock.getOutputStream().write(initToSend)
+            sock.getOutputStream().flush()
+            sock.soTimeout = ddSilenceMs
+            try {
+                val b = sock.getInputStream().read()
+                // Ответил сразу — не MTProto прокси
+                Log.d(TAG, "dd ${proxy.server}: got byte=$b immediately")
+                null
+            } catch (_: SocketTimeoutException) {
+                // Тишина = прокси ждёт наших данных = ✓
+                Log.d(TAG, "dd ${proxy.server}: silent ✓ ping=${ping}ms")
+                ping
             }
-        } catch (e: Exception) {
-            Log.d(TAG, "dd ${proxy.server}: ${e.javaClass.simpleName} ${e.message}")
-            null
         }
+    } catch (e: Exception) {
+        Log.d(TAG, "dd ${proxy.server}: ${e.javaClass.simpleName}")
+        null
     }
 
-    // ── ee (FakeTLS) ──────────────────────────────────────────────────────
+    // ── ee (реальный TLS 1.3 + MTProto nonce внутри) ────────────────────
 
-    private fun validateFakeTls(proxy: MtProtoProxy): Long? {
+    private fun validateTls(proxy: MtProtoProxy): Long? = try {
         val domain = proxy.tlsDomain ?: proxy.server
-        return try {
-            Socket().use { sock ->
-                val t0 = System.currentTimeMillis()
-                sock.connect(InetSocketAddress(proxy.server, proxy.port), connectTimeoutMs)
-                val ping = System.currentTimeMillis() - t0
-                sock.tcpNoDelay = true
-                sock.soTimeout = eeResponseMs
+        val (initToSend, _) = MtProtoObfuscation.generateForProxy(proxy.secretKey)
 
-                val hello = FakeTls.buildClientHello(proxy.secretKey, domain)
-                sock.getOutputStream().write(hello)
-                sock.getOutputStream().flush()
+        val t0 = System.currentTimeMillis()
+        val ssl = ProxyTls.connect(proxy.server, proxy.port, domain, connectTimeoutMs)
+        ssl.use { sock ->
+            // TLS рукопожатие — если провалится, это не наш прокси
+            sock.soTimeout = eeResponseMs
+            sock.startHandshake()
+            val ping = System.currentTimeMillis() - t0
 
-                // Читаем первую TLS-запись от сервера
-                val header = ByteArray(5)
-                return@use try {
-                    if (!FakeTls.readFull(sock.getInputStream(), header)) {
-                        Log.d(TAG, "ee ${proxy.server}: closed immediately"); null
-                    } else {
-                        val type = header[0].toInt() and 0xFF
-                        if (type == 0x16) {
-                            // ServerHello → сервер принял наш ClientHello ✓
-                            Log.d(TAG, "ee ${proxy.server}: ServerHello ✓ ping=${ping}ms")
-                            ping
-                        } else {
-                            Log.d(TAG, "ee ${proxy.server}: unexpected type=0x${type.toString(16)}")
-                            null
-                        }
-                    }
-                } catch (_: SocketTimeoutException) {
-                    Log.d(TAG, "ee ${proxy.server}: no ServerHello (timeout)")
-                    null
-                }
+            // Отправляем MTProto nonce поверх TLS
+            sock.outputStream.write(initToSend)
+            sock.outputStream.flush()
+
+            // Ждём тишины (прокси должен молчать, ожидая данных)
+            sock.soTimeout = ddSilenceMs
+            try {
+                val b = sock.inputStream.read()
+                Log.d(TAG, "ee ${proxy.server}: got byte=$b immediately")
+                null
+            } catch (_: SocketTimeoutException) {
+                Log.d(TAG, "ee ${proxy.server}: silent after TLS ✓ ping=${ping}ms")
+                ping
             }
-        } catch (e: Exception) {
-            Log.d(TAG, "ee ${proxy.server}: ${e.javaClass.simpleName} ${e.message}")
-            null
         }
+    } catch (e: Exception) {
+        Log.d(TAG, "ee ${proxy.server}: ${e.javaClass.simpleName} ${e.message}")
+        null
     }
 
-    // ── Батч-валидация ────────────────────────────────────────────────────
+    // ── Батч ─────────────────────────────────────────────────────────────
 
     suspend fun validateAll(
         proxies: List<MtProtoProxy>,
@@ -121,7 +109,7 @@ class ProxyValidator(
             done += batch.size
             onProgress?.invoke(done, proxies.size)
         }
-        Log.i(TAG, "Validated: ${results.size}/${proxies.size} live (dd+ee)")
+        Log.i(TAG, "Validated: ${results.size}/${proxies.size} live")
         return results.sortedBy { it.pingMs }
     }
 
