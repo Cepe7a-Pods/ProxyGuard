@@ -37,6 +37,7 @@ class ProxyGuardService : LifecycleService() {
         const val PORT                     = 1080
         const val ACTION_STOP              = "com.proxyguard.STOP"
         const val ACTION_REFRESH           = "com.proxyguard.REFRESH"
+        const val ACTION_NEXT_PROXY        = "com.proxyguard.NEXT_PROXY"
         const val ACTION_STATUS            = "com.proxyguard.STATUS"
         const val EXTRA_STATUS_TEXT        = "status_text"
         const val EXTRA_POOL_SIZE          = "pool_size"
@@ -65,6 +66,9 @@ class ProxyGuardService : LifecycleService() {
 
         fun refresh(context: Context) =
             context.startService(Intent(context, ProxyGuardService::class.java).setAction(ACTION_REFRESH))
+
+        fun nextProxy(context: Context) =
+            context.startService(Intent(context, ProxyGuardService::class.java).setAction(ACTION_NEXT_PROXY))
     }
 
     override fun onCreate() {
@@ -157,7 +161,15 @@ class ProxyGuardService : LifecycleService() {
         super.onStartCommand(intent, flags, startId)
         when (intent?.action) {
             ACTION_STOP    -> stopSelf()
-            ACTION_REFRESH -> lifecycleScope.launch { updateProxies() }
+            ACTION_REFRESH    -> lifecycleScope.launch { updateProxies() }
+            ACTION_NEXT_PROXY -> {
+                val next = proxyPool.rotateToNext()
+                if (next != null) {
+                    val text = "→ ${next.server}  | Пул: ${proxyPool.size()}"
+                    persistAndBroadcast(text, proxyPool.size(), isLoading = false)
+                    notify(text)
+                }
+            }
         }
         return START_STICKY
     }

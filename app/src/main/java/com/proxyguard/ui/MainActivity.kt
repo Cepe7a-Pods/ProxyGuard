@@ -212,7 +212,7 @@ fun MainScreen(onOpenSources: () -> Unit) {
         Spacer(Modifier.weight(1f))
 
         // Кнопки управления
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(
                 onClick = {
                     if (serviceRunning) {
@@ -232,15 +232,28 @@ fun MainScreen(onOpenSources: () -> Unit) {
                 Text(if (serviceRunning) "⏹ Стоп" else "▶ Запустить", fontSize = 16.sp)
             }
 
+            // Следующий прокси
+            AnimatedVisibility(visible = serviceRunning && poolSize > 1) {
+                OutlinedButton(
+                    onClick  = { ProxyGuardService.nextProxy(context) },
+                    modifier = Modifier.height(52.dp).width(52.dp),
+                    contentPadding = PaddingValues(0.dp),
+                ) {
+                    Text("⏭", fontSize = 18.sp)
+                }
+            }
+
+            // Обновить всё
             AnimatedVisibility(visible = serviceRunning) {
                 OutlinedButton(
                     onClick  = {
                         ProxyGuardService.refresh(context)
                         statusText = "Обновление..."; isLoading = true
                     },
-                    modifier = Modifier.height(52.dp),
+                    modifier = Modifier.height(52.dp).width(52.dp),
+                    contentPadding = PaddingValues(0.dp),
                 ) {
-                    Text("🔄", fontSize = 16.sp)
+                    Text("🔄", fontSize = 18.sp)
                 }
             }
         }
