@@ -11,6 +11,7 @@ import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
 import com.proxyguard.R
 import com.proxyguard.proxy.ProxyRepository
+import com.proxyguard.proxy.RankedProxy
 import com.proxyguard.proxy.ProxyPool
 import com.proxyguard.proxy.ProxyValidator
 import com.proxyguard.relay.BridgeSecret
@@ -45,6 +46,8 @@ class ProxyGuardService : LifecycleService() {
         private const val NOTIFICATION_ID  = 1001
         private const val CHANNEL_ID       = "proxyguard_status"
         private const val UPDATE_INTERVAL  = 15 * 60 * 1000L
+        private const val MIN_EARLY_POOL   = 5    // запустить relay как только нашли N рабочих прокси
+        private const val BATCH_SIZE       = 25   // прокси проверяются батчами по N
 
         // SharedPreferences — единственный источник истины для UI
         private const val PREFS_NAME       = "proxyguard_state"
@@ -120,28 +123,64 @@ class ProxyGuardService : LifecycleService() {
             if (all.isEmpty()) {
                 val text = "⚠ Источники недоступны. Повтор через 15 мин."
                 persistAndBroadcast(text, proxyPool.size(), isLoading = false)
-                notify(text)
-                return
+                notify(text); return
             }
 
             persistAndBroadcast("Проверка ${all.size} прокси...", proxyPool.size(), isLoading = true)
 
-            val ranked = validator.validateAll(all, batchSize = 20) { done, total ->
-                if (done % 40 == 0) {
-                    persistAndBroadcast("Проверка: $done/$total...", proxyPool.size(), isLoading = true)
+            // Ранний старт — запускаем пул сразу как нашли первые MIN_EARLY_POOL рабочих прокси.
+            // Telegram начинает работать пока фоном продолжается проверка оставшихся.
+            val accumulated = mutableListOf<RankedProxy>()
+            var earlyStartDone = false
+            var done = 0
+
+            for (batch in all.chunked(BATCH_SIZE)) {
+                val batchResults = coroutineScope {
+                    batch.map { proxy -> async { proxy to validator.validate(proxy) } }.awaitAll()
+                }
+                batchResults.forEach { (proxy, ping) ->
+                    if (ping != null) accumulated.add(RankedProxy(proxy, ping))
+                }
+                done += batch.size
+
+                when {
+                    // Ранний старт: нашли достаточно — запускаем сразу
+                    !earlyStartDone && accumulated.size >= MIN_EARLY_POOL -> {
+                        val sorted = accumulated.sortedBy { it.pingMs }
+                        proxyPool.update(sorted)
+                        val best = sorted.first()
+                        val text = "✓ ${best.proxy.server}  ${best.pingMs}ms | Пул: ${sorted.size}"
+                        persistAndBroadcast("$text  (проверка $done/${all.size}...)", sorted.size, isLoading = true)
+                        notify(text)
+                        earlyStartDone = true
+                    }
+                    // Ещё не нашли MIN_EARLY_POOL — показываем прогресс
+                    !earlyStartDone -> {
+                        persistAndBroadcast(
+                            "Проверка: $done/${all.size}... найдено: ${accumulated.size}",
+                            proxyPool.size(), isLoading = true,
+                        )
+                    }
+                    // Уже запустили — периодически обновляем статус
+                    done % (BATCH_SIZE * 4) == 0 -> {
+                        persistAndBroadcast(
+                            "✓ Пул: ${accumulated.size}  (проверка $done/${all.size}...)",
+                            accumulated.size, isLoading = true,
+                        )
+                    }
                 }
             }
 
-            if (ranked.isEmpty()) {
+            if (accumulated.isEmpty()) {
                 val text = "⚠ Нет рабочих прокси. Повтор через 15 мин."
                 persistAndBroadcast(text, 0, isLoading = false)
-                notify(text)
-                return
+                notify(text); return
             }
 
+            // Финальное обновление
+            val ranked = accumulated.sortedBy { it.pingMs }
             proxyPool.update(ranked)
             repository.save(ranked)
-
             val best = ranked.first()
             val text = "✓ ${best.proxy.server}  ${best.pingMs}ms | Пул: ${ranked.size}"
             persistAndBroadcast(text, ranked.size, isLoading = false)

@@ -297,24 +297,41 @@ private val httpClient = OkHttpClient.Builder()
     .build()
 
 private suspend fun testSource(url: String): String = withContext(Dispatchers.IO) {
+    val parser = SourceParser()
+
+    // t.me/proxy или tg://proxy — это прямая ссылка на один прокси, не список.
+    // t.me заблокирован в РФ — HTTP-запрос не пройдёт. Парсим прямо из URL.
+    if (parser.isSingleProxyUrl(url)) {
+        val proxy = parser.parseTgLink(url)
+            ?: return@withContext "Невалидная ссылка (секрет не dd/ee или неверный формат)"
+        val type = if (proxy.isFakeTls) "ee (FakeTLS)" else "dd"
+        val domain = if (proxy.isFakeTls) "  домен: ${proxy.tlsDomain}" else ""
+        return@withContext "Прокси $type — ${proxy.server}:${proxy.port}$domain"
+    }
+
+    // Обычный URL — скачиваем и парсим список
     try {
         val req = Request.Builder().url(url).build()
         val body = httpClient.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) return@withContext "HTTP ${resp.code}"
             resp.body?.string() ?: return@withContext "Пустой ответ"
         }
-        val parser = SourceParser()
         val proxies = parser.parseText(body)
-        if (proxies.isEmpty()) "dd-прокси: 0 (нет совместимых)"
-        else "dd-прокси: ${proxies.size}"
+        if (proxies.isEmpty()) return@withContext "Прокси: 0 (нет dd/ee совместимых)"
+        val dd = proxies.count { !it.isFakeTls }
+        val ee = proxies.count { it.isFakeTls }
+        "Итого: ${proxies.size}  (dd: $dd | ee/FakeTLS: $ee)"
     } catch (e: Exception) {
         Log.w("SourcesScreen", "Test failed: ${e.message}")
-        "Ошибка: ${e.message?.take(50)}"
+        "Ошибка: ${e.message?.take(60)}"
     }
 }
 
 private fun parseDdCount(result: String?): Int {
     if (result == null) return -1
-    val m = Regex("dd-прокси: (\\d+)").find(result)
-    return m?.groupValues?.get(1)?.toIntOrNull() ?: 0
+    // Форматы: "dd-прокси: N", "Итого: N", "Прокси dd —"
+    Regex("Итого: (\d+)").find(result ?: "")?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
+    Regex("dd-прокси: (\d+)").find(result ?: "")?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
+    if (result.contains("Прокси dd") || result.contains("Прокси ee")) return 1
+    return 0
 }
