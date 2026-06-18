@@ -330,8 +330,8 @@ private suspend fun testSource(url: String): String = withContext(Dispatchers.IO
 private fun parseDdCount(result: String?): Int {
     if (result == null) return -1
     // Форматы: "dd-прокси: N", "Итого: N", "Прокси dd —"
-    Regex("Итого: (\d+)").find(result ?: "")?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
-    Regex("dd-прокси: (\d+)").find(result ?: "")?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
+    Regex("""Итого: (\d+)""").find(result ?: "")?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
+    Regex("""dd-прокси: (\d+)""").find(result ?: "")?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
     if (result.contains("Прокси dd") || result.contains("Прокси ee")) return 1
     return 0
 }
