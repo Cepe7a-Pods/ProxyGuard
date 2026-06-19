@@ -194,11 +194,13 @@ private fun SourceCard(
                         CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
                         Text("Проверяем...", style = MaterialTheme.typography.bodySmall)
                     } else {
-                        val isGood = testResult?.contains("dd-прокси:") == true &&
-                                !testResult.contains(": 0")
+                        val isGood = testResult?.startsWith("✓✓✓") == true ||
+                                (testResult?.contains("Итого:") == true && !testResult.contains(": 0"))
                         Text(
                             testResult ?: "",
-                            style = MaterialTheme.typography.bodySmall,
+                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                            fontSize = 10.sp,
+                            lineHeight = 13.sp,
                             color = if (isGood) MaterialTheme.colorScheme.primary
                                     else MaterialTheme.colorScheme.error,
                         )
@@ -299,14 +301,23 @@ private val httpClient = OkHttpClient.Builder()
 private suspend fun testSource(url: String): String = withContext(Dispatchers.IO) {
     val parser = SourceParser()
 
-    // t.me/proxy или tg://proxy — это прямая ссылка на один прокси, не список.
-    // t.me заблокирован в РФ — HTTP-запрос не пройдёт. Парсим прямо из URL.
+    // t.me/proxy или tg://proxy — это прямая ссылка на один прокси.
+    // Делаем ПОЛНУЮ диагностику: TCP/TLS → MTProto nonce → req_pq → resPQ.
+    // Это покажет ТОЧНО на каком шаге обрыв, без догадок.
     if (parser.isSingleProxyUrl(url)) {
         val proxy = parser.parseTgLink(url)
             ?: return@withContext "Невалидная ссылка (секрет не dd/ee или неверный формат)"
-        val type = if (proxy.isFakeTls) "ee (FakeTLS)" else "dd"
-        val domain = if (proxy.isFakeTls) "  домен: ${proxy.tlsDomain}" else ""
-        return@withContext "Прокси $type — ${proxy.server}:${proxy.port}$domain"
+
+        val result = com.proxyguard.proxy.ProxyDiagnostic.run(proxy, timeoutMs = 10_000)
+        val lines = result.steps.mapIndexed { i, step ->
+            val icon = if (step.ok) "✓" else "✗"
+            "$icon ${step.name}: ${step.detail}"
+        }
+        val header = if (result.success)
+            "✓✓✓ РАБОТАЕТ! ping=${result.pingMs}ms\n"
+        else
+            "✗ НЕ РАБОТАЕТ\n"
+        return@withContext header + lines.joinToString("\n")
     }
 
     // Обычный URL — скачиваем и парсим список
@@ -329,9 +340,8 @@ private suspend fun testSource(url: String): String = withContext(Dispatchers.IO
 
 private fun parseDdCount(result: String?): Int {
     if (result == null) return -1
-    // Форматы: "dd-прокси: N", "Итого: N", "Прокси dd —"
-    Regex("""Итого: (\d+)""").find(result ?: "")?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
-    Regex("""dd-прокси: (\d+)""").find(result ?: "")?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
-    if (result.contains("Прокси dd") || result.contains("Прокси ee")) return 1
+    Regex("""Итого: (\d+)""").find(result).let { if (it != null) return it.groupValues[1].toIntOrNull() ?: 0 }
+    if (result.startsWith("✓✓✓")) return 1   // одиночная ссылка — РАБОТАЕТ
+    if (result.startsWith("✗")) return 0      // одиночная ссылка — не работает
     return 0
 }
