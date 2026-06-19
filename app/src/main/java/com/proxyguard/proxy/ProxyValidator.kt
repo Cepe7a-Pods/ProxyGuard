@@ -9,89 +9,87 @@ import java.net.Socket
 import java.net.SocketTimeoutException
 
 /**
- * Валидирует MTProto прокси.
+ * Валидирует MTProto прокси через РЕАЛЬНЫЙ round-trip к Telegram DC.
  *
- * dd: TCP → send nonce → ждём молчания
- *   timeout (тишина) = прокси ждёт данных = ✓ настоящий MTProto
- *   read() == -1 = сервер закрыл = ✗
+ * Раньше: проверяли "тишину" после nonce — но любой TCP black-hole
+ * (мёртвый сервер за NAT, заглушка) тоже молчит и проходил как "рабочий".
  *
- * ee: TLS handshake → send nonce → ждём молчания
- *   То же, но поверх реального TLS 1.3.
- *   TLS handshake не завершился = ✗ не наш прокси
+ * Теперь: отправляем req_pq_multi, ждём resPQ. Только проксі которые
+ * РЕАЛЬНО пересылают трафик к Telegram дадут осмысленный ответ.
  */
 class ProxyValidator(
     private val connectTimeoutMs: Int = 5_000,
-    private val ddSilenceMs: Int      = 1_500,
-    private val eeResponseMs: Int     = 6_000,
+    private val ddSilenceMs: Int      = 1_500,    // оставлено для совместимости (не используется в новой логике)
+    private val eeResponseMs: Int     = 6_000,    // оставлено для совместимости
+    private val pingTimeoutMs: Int    = 7_000,    // сколько ждать resPQ от Telegram через прокси
 ) {
 
     suspend fun validate(proxy: MtProtoProxy): Long? = withContext(Dispatchers.IO) {
-        if (proxy.isFakeTls) validateTls(proxy) else validateDd(proxy)
+        try {
+            if (proxy.isFakeTls) validateViaPing(proxy, useTls = true)
+            else validateViaPing(proxy, useTls = false)
+        } catch (e: Exception) {
+            Log.d(TAG, "${proxy.server}: ${e.javaClass.simpleName} ${e.message}")
+            null
+        }
     }
 
-    // ── dd (plain TCP + MTProto nonce) ───────────────────────────────────
+    private fun validateViaPing(proxy: MtProtoProxy, useTls: Boolean): Long? {
+        val t0 = System.currentTimeMillis()
 
-    private fun validateDd(proxy: MtProtoProxy): Long? = try {
-        val (initToSend, _) = MtProtoObfuscation.generateForProxy(proxy.secretKey)
-        Socket().use { sock ->
-            val t0 = System.currentTimeMillis()
-            sock.connect(InetSocketAddress(proxy.server, proxy.port), connectTimeoutMs)
-            val ping = System.currentTimeMillis() - t0
-            sock.tcpNoDelay = true
+        val socket = if (useTls) {
+            val domain = proxy.tlsDomain ?: proxy.server
+            val ssl = ProxyTls.connect(proxy.server, proxy.port, domain, connectTimeoutMs)
+            ssl.soTimeout = eeResponseMs
+            ssl.startHandshake()
+            ssl
+        } else {
+            Socket().apply {
+                tcpNoDelay = true
+                connect(InetSocketAddress(proxy.server, proxy.port), connectTimeoutMs)
+            }
+        }
+
+        socket.use { sock ->
+            // 1. MTProto handshake
+            val (initToSend, cipher) = MtProtoObfuscation.generateForProxy(proxy.secretKey)
             sock.getOutputStream().write(initToSend)
             sock.getOutputStream().flush()
-            sock.soTimeout = ddSilenceMs
-            try {
-                val b = sock.getInputStream().read()
-                // Ответил сразу — не MTProto прокси
-                Log.d(TAG, "dd ${proxy.server}: got byte=$b immediately")
-                null
-            } catch (_: SocketTimeoutException) {
-                // Тишина = прокси ждёт наших данных = ✓
-                Log.d(TAG, "dd ${proxy.server}: silent ✓ ping=${ping}ms")
-                ping
-            }
-        }
-    } catch (e: Exception) {
-        Log.d(TAG, "dd ${proxy.server}: ${e.javaClass.simpleName}")
-        null
-    }
 
-    // ── ee (реальный TLS 1.3 + MTProto nonce внутри) ────────────────────
+            // 2. Реальный запрос req_pq_multi
+            val request = MtProtoPing.buildRequest(cipher)
+            sock.getOutputStream().write(request)
+            sock.getOutputStream().flush()
 
-    private fun validateTls(proxy: MtProtoProxy): Long? = try {
-        val domain = proxy.tlsDomain ?: proxy.server
-        val (initToSend, _) = MtProtoObfuscation.generateForProxy(proxy.secretKey)
+            // 3. Ждём ответ — если прокси реально пересылает трафик, Telegram ответит resPQ
+            sock.soTimeout = pingTimeoutMs
+            val header = ByteArray(4)
+            readFully(sock.getInputStream(), header)
+            val decryptedHeader = cipher.decrypt(header)
+            val respLen = MtProtoPing.isValidResponse(decryptedHeader)
+                ?: run {
+                    Log.d(TAG, "${proxy.server}: invalid response length")
+                    return null
+                }
 
-        val t0 = System.currentTimeMillis()
-        val ssl = ProxyTls.connect(proxy.server, proxy.port, domain, connectTimeoutMs)
-        ssl.use { sock ->
-            // TLS рукопожатие — если провалится, это не наш прокси
-            sock.soTimeout = eeResponseMs
-            sock.startHandshake()
+            // Дочитываем тело ответа (не обязательно для решения, но дренируем буфер)
+            val body = ByteArray(respLen)
+            readFully(sock.getInputStream(), body)
+
             val ping = System.currentTimeMillis() - t0
-
-            // Отправляем MTProto nonce поверх TLS
-            sock.outputStream.write(initToSend)
-            sock.outputStream.flush()
-
-            // Ждём тишины (прокси должен молчать, ожидая данных)
-            sock.soTimeout = ddSilenceMs
-            try {
-                val b = sock.inputStream.read()
-                Log.d(TAG, "ee ${proxy.server}: got byte=$b immediately")
-                null
-            } catch (_: SocketTimeoutException) {
-                Log.d(TAG, "ee ${proxy.server}: silent after TLS ✓ ping=${ping}ms")
-                ping
-            }
+            Log.d(TAG, "${proxy.server}: ✓ REAL proxy, resPQ ${respLen}b, ping=${ping}ms")
+            return ping
         }
-    } catch (e: Exception) {
-        Log.d(TAG, "ee ${proxy.server}: ${e.javaClass.simpleName} ${e.message}")
-        null
     }
 
-    // ── Батч ─────────────────────────────────────────────────────────────
+    private fun readFully(input: java.io.InputStream, buf: ByteArray) {
+        var off = 0
+        while (off < buf.size) {
+            val n = input.read(buf, off, buf.size - off)
+            if (n < 0) throw java.io.EOFException("closed at $off/${buf.size}")
+            off += n
+        }
+    }
 
     suspend fun validateAll(
         proxies: List<MtProtoProxy>,
@@ -109,7 +107,7 @@ class ProxyValidator(
             done += batch.size
             onProgress?.invoke(done, proxies.size)
         }
-        Log.i(TAG, "Validated: ${results.size}/${proxies.size} live")
+        Log.i(TAG, "Validated: ${results.size}/${proxies.size} REAL working proxies (req_pq confirmed)")
         return results.sortedBy { it.pingMs }
     }
 
