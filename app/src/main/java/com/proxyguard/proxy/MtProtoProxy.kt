@@ -12,6 +12,8 @@ data class MtProtoProxy(
     val port: Int,
     val secret: String,
     val comment: String = "",
+    /** true — добавлен вручную одной ссылкой (доверенный, в приоритете перед авто-пулом) */
+    val isManual: Boolean = false,
 ) {
     val isFakeTls: Boolean
         get() = secret.startsWith("ee", ignoreCase = true)

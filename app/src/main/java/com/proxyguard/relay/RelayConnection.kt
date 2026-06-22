@@ -6,9 +6,7 @@ import com.proxyguard.proxy.ProxyPool
 import kotlinx.coroutines.*
 import java.io.InputStream
 import java.io.OutputStream
-import java.net.InetSocketAddress
 import java.net.Socket
-import javax.net.ssl.SSLSocket
 
 class RelayConnection(
     private val telegramSocket: Socket,
@@ -25,6 +23,7 @@ class RelayConnection(
             Log.w(TAG, "Init read failed: ${e.message}")
             telegramSocket.close(); return
         }
+        Log.i(TAG, "Init received: 64 bytes from ${telegramSocket.remoteSocketAddress}")
 
         // 2. Проверяем bridge secret
         val (protocolTag, bridgeCipher) = MtProtoObfuscation.fromClientInit(init, bridgeSecret)
@@ -39,8 +38,8 @@ class RelayConnection(
             Log.e(TAG, "Pool empty after ${POOL_WAIT_MS}ms"); telegramSocket.close(); return
         }
 
-        // 4. Подключаемся к внешнему прокси
-        val proxySocket: Socket = try {
+        // 4. Подключаемся к внешнему прокси (dd: TCP, ee: FakeTLS — см. ProxyTls/FakeTls)
+        val proxyLink: ProxyTls.Link = try {
             connectToProxy(proxy)
         } catch (e: Exception) {
             Log.w(TAG, "${proxy.server}: connect failed — ${e.message}")
@@ -50,39 +49,39 @@ class RelayConnection(
         // 5. MTProto рукопожатие с прокси (отправляем наш nonce)
         val proxyCipher: MtProtoObfuscation = try {
             val (initToSend, cipher) = MtProtoObfuscation.generateForProxy(proxy.secretKey)
-            proxySocket.getOutputStream().write(initToSend)
-            proxySocket.getOutputStream().flush()
+            proxyLink.output.write(initToSend)
+            proxyLink.output.flush()
             cipher
         } catch (e: Exception) {
             Log.w(TAG, "${proxy.server}: nonce send failed — ${e.message}")
             proxyPool.markFailed(proxy)
-            telegramSocket.close(); proxySocket.close(); return
+            telegramSocket.close(); proxyLink.close(); return
         }
 
         Log.i(TAG, "Relay up: ${proxy.server}:${proxy.port} (${if (proxy.isFakeTls) "TLS" else "dd"})")
 
-        // 6. Двунаправленный relay — одинаковый для dd и ee (TLS прозрачен)
+        // 6. Двунаправленный relay — одинаковый для dd и ee (framing прозрачен внутри Link)
         try {
             coroutineScope {
                 val t2p = launch(Dispatchers.IO) {
-                    pipe(telegramSocket.getInputStream(), proxySocket.getOutputStream()) { chunk ->
+                    pipe(telegramSocket.getInputStream(), proxyLink.output) { chunk ->
                         proxyCipher.encrypt(bridgeCipher.decrypt(chunk))
                     }
                 }
                 val p2t = launch(Dispatchers.IO) {
-                    pipe(proxySocket.getInputStream(), telegramSocket.getOutputStream()) { chunk ->
+                    pipe(proxyLink.input, telegramSocket.getOutputStream()) { chunk ->
                         bridgeCipher.encrypt(proxyCipher.decrypt(chunk))
                     }
                 }
                 t2p.invokeOnCompletion {
                     p2t.cancel()
                     runCatching { telegramSocket.close() }
-                    runCatching { proxySocket.close() }
+                    proxyLink.close()
                 }
                 p2t.invokeOnCompletion {
                     t2p.cancel()
                     runCatching { telegramSocket.close() }
-                    runCatching { proxySocket.close() }
+                    proxyLink.close()
                 }
             }
         } catch (_: CancellationException) {
@@ -91,30 +90,20 @@ class RelayConnection(
             proxyPool.markFailed(proxy)
         } finally {
             runCatching { telegramSocket.close() }
-            runCatching { proxySocket.close() }
+            proxyLink.close()
         }
     }
 
     /**
-     * dd: обычный TCP Socket
-     * ee: SSLSocket с реальным TLS 1.3 (MTProto идёт ВНУТРИ TLS сессии)
+     * dd: обычный TCP Socket.
+     * ee: FakeTLS-хендшейк (HMAC-digest в ClientHello.random, см. FakeTls.kt) —
+     *     НЕ настоящий TLS, никакого SSLSocket.
      */
-    private fun connectToProxy(proxy: MtProtoProxy): Socket {
-        return if (!proxy.isFakeTls) {
-            Socket().apply {
-                tcpNoDelay = true
-                connect(InetSocketAddress(proxy.server, proxy.port), CONNECT_TIMEOUT)
-                soTimeout = 0
-            }
-        } else {
-            val domain = proxy.tlsDomain ?: proxy.server
-            val ssl = ProxyTls.connect(proxy.server, proxy.port, domain, CONNECT_TIMEOUT)
-            ssl.soTimeout = TLS_HANDSHAKE_TIMEOUT
-            ssl.startHandshake()
-            ssl.soTimeout = 0
-            ssl.tcpNoDelay = true
-            ssl
-        }
+    private fun connectToProxy(proxy: MtProtoProxy): ProxyTls.Link {
+        val link = ProxyTls.connect(proxy, CONNECT_TIMEOUT)
+        link.socket.soTimeout = 0
+        link.socket.tcpNoDelay = true
+        return link
     }
 
     private fun pipe(from: InputStream, to: OutputStream, transform: (ByteArray) -> ByteArray) {
@@ -139,7 +128,6 @@ class RelayConnection(
     companion object {
         private const val TAG                  = "RelayConnection"
         private const val CONNECT_TIMEOUT      = 10_000
-        private const val TLS_HANDSHAKE_TIMEOUT = 8_000
         private const val BUFFER_SIZE          = 8_192
         private const val POOL_WAIT_MS         = 80_000L
         private const val POOL_POLL_MS         = 2_000L

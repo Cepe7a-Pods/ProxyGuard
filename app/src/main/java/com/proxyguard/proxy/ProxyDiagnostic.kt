@@ -2,8 +2,7 @@ package com.proxyguard.proxy
 
 import com.proxyguard.relay.MtProtoObfuscation
 import com.proxyguard.relay.ProxyTls
-import java.net.InetSocketAddress
-import java.net.Socket
+import com.proxyguard.relay.readFully
 
 /**
  * Пошаговая диагностика одного прокси с подробным логом каждого этапа.
@@ -19,35 +18,33 @@ object ProxyDiagnostic {
         val steps = mutableListOf<Step>()
         val t0 = System.currentTimeMillis()
 
-        // ── Шаг 1: TCP/TLS соединение ──────────────────────────────────
-        val socket = try {
-            if (proxy.isFakeTls) {
-                val domain = proxy.tlsDomain ?: proxy.server
-                steps.add(Step("Домен SNI", true, domain))
-                val ssl = ProxyTls.connect(proxy.server, proxy.port, domain, timeoutMs)
-                ssl.soTimeout = timeoutMs
-                ssl.startHandshake()
-                steps.add(Step("TLS handshake", true, "${ssl.session.protocol} ${ssl.session.cipherSuite}"))
-                ssl
-            } else {
-                val s = Socket().apply {
-                    tcpNoDelay = true
-                    connect(InetSocketAddress(proxy.server, proxy.port), timeoutMs)
+        if (proxy.isFakeTls) {
+            steps.add(Step("Домен SNI", true, proxy.tlsDomain ?: proxy.server))
+        }
+
+        // ── Шаг 1: TCP / FakeTLS соединение ────────────────────────────
+        val link = try {
+            ProxyTls.connect(proxy, timeoutMs).also {
+                if (proxy.isFakeTls) {
+                    steps.add(Step("FakeTLS handshake", true, "digest подтверждён сервером"))
+                } else {
+                    steps.add(Step("TCP connect", true, "${proxy.server}:${proxy.port}"))
                 }
-                steps.add(Step("TCP connect", true, "${proxy.server}:${proxy.port}"))
-                s
             }
         } catch (e: Exception) {
-            steps.add(Step(if (proxy.isFakeTls) "TLS handshake" else "TCP connect", false, "${e.javaClass.simpleName}: ${e.message}"))
+            steps.add(Step(if (proxy.isFakeTls) "FakeTLS handshake" else "TCP connect", false, "${e.javaClass.simpleName}: ${e.message}"))
             return Result(steps, false, null)
         }
 
-        socket.use { sock ->
+        link.use {
+            val input = link.input
+            val output = link.output
+
             // ── Шаг 2: MTProto nonce ────────────────────────────────────
             val (initToSend, cipher) = MtProtoObfuscation.generateForProxy(proxy.secretKey)
             try {
-                sock.getOutputStream().write(initToSend)
-                sock.getOutputStream().flush()
+                output.write(initToSend)
+                output.flush()
                 steps.add(Step("MTProto nonce отправлен", true, "${initToSend.size} байт, ключ=${proxy.secretKey.toHex().take(12)}..."))
             } catch (e: Exception) {
                 steps.add(Step("MTProto nonce", false, "${e.javaClass.simpleName}: ${e.message}"))
@@ -57,8 +54,8 @@ object ProxyDiagnostic {
             // ── Шаг 3: req_pq_multi запрос ──────────────────────────────
             val request = try {
                 MtProtoPing.buildRequest(cipher).also {
-                    sock.getOutputStream().write(it)
-                    sock.getOutputStream().flush()
+                    output.write(it)
+                    output.flush()
                 }
             } catch (e: Exception) {
                 steps.add(Step("req_pq_multi отправка", false, "${e.javaClass.simpleName}: ${e.message}"))
@@ -67,10 +64,10 @@ object ProxyDiagnostic {
             steps.add(Step("req_pq_multi отправлен", true, "${request.size} байт"))
 
             // ── Шаг 4: ждём ответ от Telegram через прокси ──────────────
-            sock.soTimeout = timeoutMs
+            link.socket.soTimeout = timeoutMs
             val header = ByteArray(4)
             try {
-                readFully(sock.getInputStream(), header)
+                input.readFully(header)
             } catch (e: Exception) {
                 steps.add(Step("Ответ от Telegram", false, "${e.javaClass.simpleName}: ${e.message} — прокси НЕ пересылает трафик"))
                 return Result(steps, false, null)
@@ -89,7 +86,7 @@ object ProxyDiagnostic {
 
             val body = ByteArray(respLen)
             try {
-                readFully(sock.getInputStream(), body)
+                input.readFully(body)
             } catch (e: Exception) {
                 steps.add(Step("Тело ответа", false, "${e.javaClass.simpleName}: ${e.message}"))
                 return Result(steps, false, null)
@@ -99,15 +96,6 @@ object ProxyDiagnostic {
 
             val ping = System.currentTimeMillis() - t0
             return Result(steps, true, ping)
-        }
-    }
-
-    private fun readFully(input: java.io.InputStream, buf: ByteArray) {
-        var off = 0
-        while (off < buf.size) {
-            val n = input.read(buf, off, buf.size - off)
-            if (n < 0) throw java.io.EOFException("closed at $off/${buf.size}")
-            off += n
         }
     }
 

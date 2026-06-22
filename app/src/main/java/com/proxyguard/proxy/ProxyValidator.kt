@@ -3,10 +3,8 @@ package com.proxyguard.proxy
 import android.util.Log
 import com.proxyguard.relay.MtProtoObfuscation
 import com.proxyguard.relay.ProxyTls
+import com.proxyguard.relay.readFully
 import kotlinx.coroutines.*
-import java.net.InetSocketAddress
-import java.net.Socket
-import java.net.SocketTimeoutException
 
 /**
  * Валидирует MTProto прокси через РЕАЛЬНЫЙ round-trip к Telegram DC.
@@ -20,14 +18,18 @@ import java.net.SocketTimeoutException
 class ProxyValidator(
     private val connectTimeoutMs: Int = 5_000,
     private val ddSilenceMs: Int      = 1_500,    // оставлено для совместимости (не используется в новой логике)
-    private val eeResponseMs: Int     = 6_000,    // оставлено для совместимости
+    private val eeResponseMs: Int     = 6_000,    // таймаут TCP-connect + FakeTLS handshake для ee
     private val pingTimeoutMs: Int    = 7_000,    // сколько ждать resPQ от Telegram через прокси
 ) {
 
     suspend fun validate(proxy: MtProtoProxy): Long? = withContext(Dispatchers.IO) {
         try {
-            if (proxy.isFakeTls) validateViaPing(proxy, useTls = true)
-            else validateViaPing(proxy, useTls = false)
+            val ping = validateViaPing(proxy, useTls = proxy.isFakeTls) ?: return@withContext null
+            if (!proxy.isManual && ping > MAX_AUTO_PING_MS) {
+                Log.d(TAG, "${proxy.server}: ping ${ping}ms > ${MAX_AUTO_PING_MS}ms, отбраковываем (авто-пул)")
+                return@withContext null
+            }
+            ping
         } catch (e: Exception) {
             Log.d(TAG, "${proxy.server}: ${e.javaClass.simpleName} ${e.message}")
             null
@@ -37,34 +39,23 @@ class ProxyValidator(
     private fun validateViaPing(proxy: MtProtoProxy, useTls: Boolean): Long? {
         val t0 = System.currentTimeMillis()
 
-        val socket = if (useTls) {
-            val domain = proxy.tlsDomain ?: proxy.server
-            val ssl = ProxyTls.connect(proxy.server, proxy.port, domain, connectTimeoutMs)
-            ssl.soTimeout = eeResponseMs
-            ssl.startHandshake()
-            ssl
-        } else {
-            Socket().apply {
-                tcpNoDelay = true
-                connect(InetSocketAddress(proxy.server, proxy.port), connectTimeoutMs)
-            }
-        }
+        val link = ProxyTls.connect(proxy, if (useTls) eeResponseMs else connectTimeoutMs)
 
-        socket.use { sock ->
+        link.use {
             // 1. MTProto handshake
             val (initToSend, cipher) = MtProtoObfuscation.generateForProxy(proxy.secretKey)
-            sock.getOutputStream().write(initToSend)
-            sock.getOutputStream().flush()
+            link.output.write(initToSend)
+            link.output.flush()
 
             // 2. Реальный запрос req_pq_multi
             val request = MtProtoPing.buildRequest(cipher)
-            sock.getOutputStream().write(request)
-            sock.getOutputStream().flush()
+            link.output.write(request)
+            link.output.flush()
 
             // 3. Ждём ответ — если прокси реально пересылает трафик, Telegram ответит resPQ
-            sock.soTimeout = pingTimeoutMs
+            link.socket.soTimeout = pingTimeoutMs
             val header = ByteArray(4)
-            readFully(sock.getInputStream(), header)
+            link.input.readFully(header)
             val decryptedHeader = cipher.decrypt(header)
             val respLen = MtProtoPing.isValidResponse(decryptedHeader)
                 ?: run {
@@ -74,20 +65,11 @@ class ProxyValidator(
 
             // Дочитываем тело ответа (не обязательно для решения, но дренируем буфер)
             val body = ByteArray(respLen)
-            readFully(sock.getInputStream(), body)
+            link.input.readFully(body)
 
             val ping = System.currentTimeMillis() - t0
             Log.d(TAG, "${proxy.server}: ✓ REAL proxy, resPQ ${respLen}b, ping=${ping}ms")
             return ping
-        }
-    }
-
-    private fun readFully(input: java.io.InputStream, buf: ByteArray) {
-        var off = 0
-        while (off < buf.size) {
-            val n = input.read(buf, off, buf.size - off)
-            if (n < 0) throw java.io.EOFException("closed at $off/${buf.size}")
-            off += n
         }
     }
 
@@ -111,5 +93,8 @@ class ProxyValidator(
         return results.sortedBy { it.pingMs }
     }
 
-    companion object { private const val TAG = "ProxyValidator" }
+    companion object {
+        private const val TAG = "ProxyValidator"
+        private const val MAX_AUTO_PING_MS = 500L
+    }
 }

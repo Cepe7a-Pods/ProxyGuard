@@ -52,7 +52,7 @@ class SourceParser {
     private fun fetchSource(src: ProxySourceConfig): List<MtProtoProxy> {
         // Если URL сам является tg://proxy или t.me/proxy ссылкой — парсим напрямую
         if (isSingleProxyUrl(src.url)) {
-            val proxy = parseTgLink(src.url)
+            val proxy = parseTgLink(src.url)?.copy(isManual = true)
             return if (proxy != null) listOf(proxy) else emptyList()
         }
 

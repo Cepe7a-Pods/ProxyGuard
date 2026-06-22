@@ -32,7 +32,11 @@ class LocalRelayServer(
         }
 
         val ss = try {
-            ServerSocket(port, 50, InetAddress.getLoopbackAddress())
+            // getLoopbackAddress() неоднозначен: на части систем/настроек резолвится
+            // в IPv6 (::1) и слушает ТОЛЬКО IPv6 (tcp6 :::1080), а Telegram стучится
+            // по IPv4 на 127.0.0.1 → connection refused / вечный SYN_SENT.
+            // Биндим явно на IPv4 loopback. Не 0.0.0.0 — незачем светить порт в сеть.
+            ServerSocket(port, 50, InetAddress.getByName("127.0.0.1"))
         } catch (e: Exception) {
             Log.e(TAG, "Cannot bind to port $port: ${e.message}")
             return
@@ -49,6 +53,7 @@ class LocalRelayServer(
                         tcpNoDelay = true
                         soTimeout = INIT_READ_TIMEOUT_MS  // таймаут только для чтения nonce
                     }
+                    Log.i(TAG, "Accepted connection from ${client.remoteSocketAddress}")
                     // Запускаем relay для каждого клиента в отдельной корутине
                     launch {
                         try {

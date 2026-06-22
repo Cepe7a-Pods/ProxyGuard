@@ -1,43 +1,37 @@
 package com.proxyguard.relay
 
+import com.proxyguard.proxy.MtProtoProxy
+import java.io.Closeable
+import java.io.InputStream
+import java.io.OutputStream
 import java.net.InetSocketAddress
-import java.security.cert.X509Certificate
-import javax.net.ssl.*
+import java.net.Socket
 
 /**
- * ee-prefix прокси используют РЕАЛЬНЫЙ TLS 1.3 как транспорт.
- * MTProto obfuscated stream идёт ВНУТРИ TLS сессии.
- * Никакого FakeTLS — просто SSLSocket + MTProto nonce.
+ * Единая точка установки транспорта до MTProto-прокси: обычный TCP (dd-секрет)
+ * или FakeTLS (ee-секрет, см. FakeTls.kt). Вызывающему коду неважно, какой это
+ * прокси — он просто получает Link с .input/.output/.socket.
  */
 object ProxyTls {
 
-    @Volatile private var factory: SSLSocketFactory? = null
+    class Link(
+        val socket: Socket,
+        val input: InputStream,
+        val output: OutputStream
+    ) : Closeable {
+        override fun close() { runCatching { socket.close() } }
+    }
 
-    /** Подключается к прокси через TLS, возвращает готовый SSLSocket */
-    fun connect(host: String, port: Int, domain: String, timeoutMs: Int): SSLSocket {
-        val f = factory ?: buildFactory().also { factory = it }
-        // Создаём TCP соединение вручную чтобы контролировать таймаут
-        val raw = java.net.Socket()
-        raw.connect(InetSocketAddress(host, port), timeoutMs)
-        // Оборачиваем в TLS
-        val ssl = f.createSocket(raw, host, port, /* autoClose= */ true) as SSLSocket
-        // SNI — используем домен из секрета (обязательно для маршрутизации)
-        ssl.sslParameters = ssl.sslParameters.apply {
-            serverNames = listOf(SNIHostName(domain))
+    fun connect(proxy: MtProtoProxy, timeoutMs: Int): Link {
+        return if (proxy.isFakeTls) {
+            val domain = proxy.tlsDomain ?: proxy.server
+            val conn = FakeTls.connect(proxy.server, proxy.port, domain, proxy.secretKey, timeoutMs)
+            Link(conn.socket, conn.input, conn.output)
+        } else {
+            val s = Socket()
+            s.tcpNoDelay = true
+            s.connect(InetSocketAddress(proxy.server, proxy.port), timeoutMs)
+            Link(s, s.getInputStream(), s.getOutputStream())
         }
-        return ssl
-    }
-
-    /** SSLContext принимает любой сертификат сервера */
-    private fun buildFactory(): SSLSocketFactory {
-        val ctx = SSLContext.getInstance("TLS")
-        ctx.init(null, arrayOf(TrustAll), null)
-        return ctx.socketFactory
-    }
-
-    private object TrustAll : X509TrustManager {
-        override fun checkClientTrusted(c: Array<X509Certificate>, a: String) {}
-        override fun checkServerTrusted(c: Array<X509Certificate>, a: String) {}
-        override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
     }
 }

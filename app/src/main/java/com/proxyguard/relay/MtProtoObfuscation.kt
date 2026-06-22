@@ -51,18 +51,13 @@ class MtProtoObfuscation(
         fun fromClientInit(init: ByteArray, secret: ByteArray): Pair<ByteArray, MtProtoObfuscation> {
             require(init.size == 64) { "Init must be exactly 64 bytes, got ${init.size}" }
 
-            val keyPart = init.copyOfRange(8, 40)    // 32 байта ключевого материала
-            val ivPart  = init.copyOfRange(40, 56)   // 16 байт IV
-
-            // Два ключа — два направления трафика
-            val encKey = sha256(secret + keyPart)
-            val decKey = sha256(secret + keyPart.reversedArray())
+            val (keyA, ivA, keyB, ivB) = deriveKeys(init, secret)
 
             // Мы СЕРВЕР:
-            //   decryptCipher → расшифровываем входящее от Telegram  (encKey, encIv)
-            //   encryptCipher → шифруем исходящее к Telegram          (decKey, decIv)
-            val decryptCipher = aesCtr(encKey, ivPart)
-            val encryptCipher = aesCtr(decKey, ivPart.reversedArray())
+            //   decryptCipher → расшифровываем входящее от Telegram  (направление A, как клиент шифровал)
+            //   encryptCipher → шифруем исходящее к Telegram          (направление B, reversed)
+            val decryptCipher = aesCtr(keyA, ivA)
+            val encryptCipher = aesCtr(keyB, ivB)
 
             // Прогоняем все 64 байта через decryptCipher:
             //   — синхронизируем счётчик с Telegram (он тоже прошёл 64 байта при отправке nonce)
@@ -83,17 +78,13 @@ class MtProtoObfuscation(
         fun generateForProxy(secret: ByteArray): Pair<ByteArray, MtProtoObfuscation> {
             val init = generateValidInit()
 
-            val keyPart = init.copyOfRange(8, 40)
-            val ivPart  = init.copyOfRange(40, 56)
-
-            val encKey = sha256(secret + keyPart)
-            val decKey = sha256(secret + keyPart.reversedArray())
+            val (keyA, ivA, keyB, ivB) = deriveKeys(init, secret)
 
             // Мы КЛИЕНТ:
-            //   encryptCipher → шифруем исходящее к прокси       (encKey)
-            //   decryptCipher → расшифровываем входящее от прокси (decKey)
-            val encryptCipher = aesCtr(encKey, ivPart)
-            val decryptCipher = aesCtr(decKey, ivPart.reversedArray())
+            //   encryptCipher → шифруем исходящее к прокси        (направление A)
+            //   decryptCipher → расшифровываем входящее от прокси  (направление B, reversed)
+            val encryptCipher = aesCtr(keyA, ivA)
+            val decryptCipher = aesCtr(keyB, ivB)
 
             // Формируем пакет для отправки прокси:
             //   байты [0..55]  — plaintext (прокси использует их для деривации ключей)
@@ -122,6 +113,47 @@ class MtProtoObfuscation(
                 // иначе генерируем снова
             }
         }
+
+        /**
+         * Каноничный вывод ключей obfuscated2 / padded-intermediate.
+         * Сверено с тремя независимыми реализациями (alexbers/mtprotoproxy,
+         * seriyps/mtproto_proxy, Flowseal/tg-ws-proxy) — все три сходятся в этом алгоритме.
+         *
+         * block48 = init[8..56) = prekey(32 байта) ++ iv(16 байт)
+         *
+         * Направление A («как есть»):
+         *   prekeyA = block48[0..32), ivA = block48[32..48)
+         *
+         * Направление B (reversed):
+         *   ВЕСЬ 48-байтовый block48 реверсируется КАК ЕДИНЫЙ БУФЕР
+         *   (НЕ prekey и iv по отдельности!), затем нарезается заново на 32+16:
+         *   block48Rev = reverse(block48); prekeyB = block48Rev[0..32), ivB = block48Rev[32..48)
+         *
+         * Ключ: sha256(prekey ++ secret) — prekey ПЕРВЫМ, secret ВТОРЫМ.
+         * (Раньше тут было sha256(secret + prekey) — обратный порядок —
+         *  и реверс prekey/iv по отдельности вместо реверса всего блока.
+         *  Из-за лавинного эффекта SHA-256 это давало два независимых, полностью
+         *  не совпадающих с реальным сервером ключа в обоих направлениях.)
+         */
+        private fun deriveKeys(init: ByteArray, secret: ByteArray): KeySet {
+            val block48 = init.copyOfRange(8, 56)        // prekey(32) ++ iv(16)
+            val prekeyA = block48.copyOfRange(0, 32)
+            val ivA     = block48.copyOfRange(32, 48)
+
+            val block48Rev = block48.reversedArray()      // реверс ВСЕГО блока целиком
+            val prekeyB = block48Rev.copyOfRange(0, 32)
+            val ivB     = block48Rev.copyOfRange(32, 48)
+
+            val keyA = sha256(prekeyA + secret)            // prekey ++ secret, не secret ++ prekey
+            val keyB = sha256(prekeyB + secret)
+
+            return KeySet(keyA, ivA, keyB, ivB)
+        }
+
+        private data class KeySet(
+            val keyA: ByteArray, val ivA: ByteArray,
+            val keyB: ByteArray, val ivB: ByteArray,
+        )
 
         private fun aesCtr(key: ByteArray, iv: ByteArray): Cipher =
             Cipher.getInstance("AES/CTR/NoPadding").apply {
