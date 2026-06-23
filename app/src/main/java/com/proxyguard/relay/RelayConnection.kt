@@ -163,7 +163,7 @@ class RelayConnection(
 
     private suspend fun waitForProxy() = withTimeoutOrNull(POOL_WAIT_MS) {
         while (proxyPool.isEmpty()) { delay(POOL_POLL_MS) }
-        proxyPool.getForConnection()   // load-spread по ручным прокси, не всегда один и тот же
+        proxyPool.getBest()   // ← было getForConnection(), меняем обратно
     }
 
     private fun ByteArray.toHex() = joinToString("") { "%02x".format(it) }
