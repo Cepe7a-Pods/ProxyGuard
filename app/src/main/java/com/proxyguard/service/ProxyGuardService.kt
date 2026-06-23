@@ -30,6 +30,7 @@ class ProxyGuardService : LifecycleService() {
     private lateinit var sourceRepo: SourceRepository
     private lateinit var repository: ProxyRepository
     private lateinit var prefs: SharedPreferences
+    private lateinit var healthChecker: ProxyHealthChecker
 
     @Volatile private var isUpdating = false
 
@@ -87,6 +88,22 @@ class ProxyGuardService : LifecycleService() {
         val bridgeSecret = BridgeSecret.getBytes(this)
         relayServer = LocalRelayServer(PORT, bridgeSecret, proxyPool)
         relayServer.start()
+
+        healthChecker = ProxyHealthChecker(
+            proxyPool = proxyPool,
+            validator = validator,
+            onProxyFailed = { dead, next ->
+                val text = if (next != null)
+                    "⚠ $dead недоступен → $next | Пул: ${proxyPool.size()}"
+                else
+                    "⚠ Нет живых прокси — обновляю..."
+                persistAndBroadcast(text, proxyPool.size(), isLoading = next == null)
+                notify(text)
+                // Если пул исчерпан — инициируем полный refresh
+                if (next == null) lifecycleScope.launch { updateProxies() }
+            },
+        )
+        healthChecker.start()
 
         ProxyUpdateWorker.schedule(this)
 
@@ -214,6 +231,7 @@ class ProxyGuardService : LifecycleService() {
     }
 
     override fun onDestroy() {
+        healthChecker.stop()
         relayServer.stop()
         prefs.edit()
             .putBoolean(PREF_RUNNING, false)
