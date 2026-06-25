@@ -50,7 +50,7 @@ class SourceParser {
     ) = fetchAll(SourceRepository.DEFAULT_SOURCES, onSourceDone)
 
     private fun fetchSource(src: ProxySourceConfig): List<MtProtoProxy> {
-        // Если URL сам является tg://proxy или t.me/proxy ссылкой — парсим напрямую
+        // Если URL сам является ссылкой на прокси — парсим напрямую, без HTTP-запроса
         if (isSingleProxyUrl(src.url)) {
             val proxy = parseTgLink(src.url)?.copy(isManual = true)
             return if (proxy != null) listOf(proxy) else emptyList()
@@ -67,13 +67,20 @@ class SourceParser {
     }
 
     /**
-     * Парсит текст и возвращает dd-прокси.
-     * Публичный метод — используется из SourcesScreen для теста.
+     * Парсит текст (HTML/plain) и извлекает все dd/ee-прокси.
+     * Публичный — используется из SourcesScreen для тестового разбора.
+     *
+     * Поддерживаемые форматы ссылок в тексте:
+     *   tg://proxy?...
+     *   https://t.me/proxy?...
+     *   http://t.me/proxy?...
+     *   t.me/proxy?...          ← bare, без схемы (часто в TG-группах)
      */
     fun parseText(text: String): List<MtProtoProxy> {
         val result  = mutableListOf<MtProtoProxy>()
         val pattern = Regex(
-            """(?:tg://proxy|https?://t\.me/proxy)\?([^\s"'<>\[\]]+)""",
+            // tg://proxy?  или  (http(s)://)t.me/proxy?  или  bare t.me/proxy? (не после / или :)
+            """(?:tg://proxy|https?://t\.me/proxy|(?<![/:\w])t\.me/proxy)\?([^\s"'<>\[\]]+)""",
             RegexOption.IGNORE_CASE,
         )
         pattern.findAll(text).forEach { m ->
@@ -83,25 +90,44 @@ class SourceParser {
     }
 
     /**
-     * Парсит одну tg://proxy или t.me/proxy ссылку.
-     * Принимает только dd-prefix секреты.
+     * Парсит одну ссылку на прокси в любом из форматов:
+     *   tg://proxy?server=...&port=...&secret=...
+     *   https://t.me/proxy?...
+     *   http://t.me/proxy?...
+     *   t.me/proxy?...
+     *
+     * Принимает только dd- и ee-prefix секреты.
+     * Возвращает null если формат неверный или секрет не распознан.
      */
     fun parseTgLink(url: String): MtProtoProxy? = runCatching {
-        val normalized = url
+        // Нормализуем любой поддерживаемый формат в "https://tg.proxy?..."
+        // (Uri.parse не умеет в tg:// и голый t.me/)
+        val normalized = url.trim()
             .replace(Regex("^https?://t\\.me/proxy", RegexOption.IGNORE_CASE), "tg://proxy")
+            .replace(Regex("^t\\.me/proxy",          RegexOption.IGNORE_CASE), "tg://proxy")
             .replace("tg://proxy", "https://tg.proxy")
+
         val uri    = Uri.parse(normalized)
         val server = uri.getQueryParameter("server")?.trim('.')?.ifEmpty { null } ?: return null
-        val port   = uri.getQueryParameter("port")?.toIntOrNull() ?: return null
+        val port   = uri.getQueryParameter("port")?.toIntOrNull()
+                         ?.takeIf { it in 1..65535 } ?: return null
         val raw    = uri.getQueryParameter("secret") ?: return null
         val hex    = normalizeSecret(raw) ?: return null
         if (!hex.startsWith("dd") && !hex.startsWith("ee")) return null
         MtProtoProxy(server = server, port = port, secret = hex)
     }.getOrNull()
 
-    /** True если URL — это прямая tg://proxy или t.me/proxy ссылка (не список) */
-    fun isSingleProxyUrl(url: String): Boolean =
-        url.contains(Regex("""^(tg://proxy|https?://t\.me/proxy)\?""", RegexOption.IGNORE_CASE))
+    /**
+     * Возвращает true если [url] является прямой ссылкой на один прокси (не список).
+     * Поддерживает все форматы: tg://, https://t.me/, http://t.me/, bare t.me/.
+     */
+    fun isSingleProxyUrl(url: String): Boolean {
+        val u = url.trimStart()
+        return u.startsWith("tg://proxy?",         ignoreCase = true)
+            || u.startsWith("https://t.me/proxy?", ignoreCase = true)
+            || u.startsWith("http://t.me/proxy?",  ignoreCase = true)
+            || u.startsWith("t.me/proxy?",         ignoreCase = true)
+    }
 
     private fun normalizeSecret(raw: String): String? {
         val s = runCatching { URLDecoder.decode(raw, "UTF-8") }.getOrDefault(raw)

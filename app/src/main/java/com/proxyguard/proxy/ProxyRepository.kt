@@ -57,6 +57,6 @@ class ProxyRepository(context: Context) {
         private const val KEY_PROXIES  = "ranked_proxies"
         private const val KEY_TIMESTAMP = "saved_at"
         private const val MAX_CACHED   = 100
-        private const val MAX_AGE_MS   = 2 * 60 * 60 * 1000L  // 2 часа
+        private const val MAX_AGE_MS   = 24 * 60 * 60 * 1000L  // 24 часа
     }
 }

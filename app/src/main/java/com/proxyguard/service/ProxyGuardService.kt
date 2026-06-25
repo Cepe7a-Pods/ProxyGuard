@@ -47,7 +47,7 @@ class ProxyGuardService : LifecycleService() {
         private const val NOTIFICATION_ID  = 1001
         private const val CHANNEL_ID       = "proxyguard_status"
         private const val UPDATE_INTERVAL  = 15 * 60 * 1000L
-        private const val MIN_EARLY_POOL   = 5    // запустить relay как только нашли N рабочих прокси
+        private const val MIN_EARLY_POOL   = 1    // запустить relay как только нашли N рабочих прокси
         private const val BATCH_SIZE       = 25   // прокси проверяются батчами по N
 
         // SharedPreferences — единственный источник истины для UI
@@ -153,7 +153,14 @@ class ProxyGuardService : LifecycleService() {
 
             for (batch in all.chunked(BATCH_SIZE)) {
                 val batchResults = coroutineScope {
-                    batch.map { proxy -> async { proxy to validator.validate(proxy) } }.awaitAll()
+                    batch.map { proxy ->
+                        async {
+                            // Retry: один повтор через 500ms при провале
+                            val ping = validator.validate(proxy)
+                                ?: run { delay(500L); validator.validate(proxy) }
+                            proxy to ping
+                        }
+                    }.awaitAll()
                 }
                 batchResults.forEach { (proxy, ping) ->
                     if (ping != null) accumulated.add(RankedProxy(proxy, ping))

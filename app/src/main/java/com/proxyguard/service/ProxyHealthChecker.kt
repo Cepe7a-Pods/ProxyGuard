@@ -6,15 +6,13 @@ import com.proxyguard.proxy.ProxyValidator
 import kotlinx.coroutines.*
 
 /**
- * Фоновый health-check текущего лучшего прокси.
+ * Фоновая проверка текущего лучшего прокси каждые [CHECK_INTERVAL_MS].
  *
- * Каждые [checkIntervalMs] проверяет [ProxyPool.getBest()] через [ProxyValidator].
- * Если прокси мёртв:
- *   1. Помечает его failed в пуле.
- *   2. Вызывает [onProxyFailed] — сервис обновляет статус и, если пул пуст,
- *      инициирует полный refresh источников.
+ * Использует [ProxyPool.softFail] вместо [ProxyPool.markFailed]:
+ *   - 1-й провал → прокси временно выводится из ротации (вдруг разовый сетевой сбой)
+ *   - 2-й провал подряд → прокси удаляется из пула, [onProxyFailed] вызывается
  *
- * Запускать через [start], останавливать через [stop] вместе с сервисом.
+ * Счётчики soft-fail сбрасываются при каждом pool.update() (полная ре-валидация).
  */
 class ProxyHealthChecker(
     private val proxyPool: ProxyPool,
@@ -25,7 +23,7 @@ class ProxyHealthChecker(
 
     fun start() {
         scope.launch {
-            delay(INITIAL_DELAY_MS)   // не мешаем первичной валидации пула
+            delay(INITIAL_DELAY_MS)
             while (isActive) {
                 runCheck()
                 delay(CHECK_INTERVAL_MS)
@@ -49,18 +47,24 @@ class ProxyHealthChecker(
             return
         }
 
-        // Прокси мёртв
-        Log.w(TAG, "${current.server}: health check FAILED → markFailed")
-        proxyPool.markFailed(current)
+        // Прокси не ответил — мягкий отказ (с учётом счётчика повторов)
+        Log.w(TAG, "${current.server}: health check FAILED → softFail")
+        val evicted = proxyPool.softFail(current)
 
-        val next = proxyPool.getBest()
-        Log.w(TAG, "Rotated to: ${next?.server ?: "none (pool exhausted)"}")
-        onProxyFailed(current.server, next?.server)
+        if (evicted) {
+            // Прокси удалён из пула (2-й провал подряд) — оповещаем сервис
+            val next = proxyPool.getBest()
+            Log.w(TAG, "Evicted from pool: ${current.server}. Next: ${next?.server ?: "none"}")
+            onProxyFailed(current.server, next?.server)
+        } else {
+            // Первый провал — прокси временно недоступен, ждём следующей проверки
+            Log.i(TAG, "${current.server}: suspended (1st soft-fail), will retry in ${CHECK_INTERVAL_MS / 1000}s")
+        }
     }
 
     companion object {
-        private const val TAG              = "ProxyHealthChecker"
-        private const val INITIAL_DELAY_MS = 90_000L    // ждём пока пул наберётся после старта
-        private const val CHECK_INTERVAL_MS = 2 * 60 * 1000L  // каждые 2 минуты
+        private const val TAG               = "ProxyHealthChecker"
+        private const val INITIAL_DELAY_MS  = 90_000L          // не мешаем первичной валидации
+        private const val CHECK_INTERVAL_MS = 2 * 60 * 1000L   // каждые 2 минуты
     }
 }

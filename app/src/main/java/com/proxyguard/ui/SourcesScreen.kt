@@ -41,7 +41,6 @@ fun SourcesScreen(onBack: () -> Unit) {
     var sources by remember { mutableStateOf(repo.loadAll()) }
     var showAddDialog by remember { mutableStateOf(false) }
 
-    // Локальный кэш тестов: id → состояние ("testing" / "N dd-прокси" / "Ошибка")
     val testResults = remember { mutableStateMapOf<String, String>() }
 
     Scaffold(
@@ -97,9 +96,9 @@ fun SourcesScreen(onBack: () -> Unit) {
 
     if (showAddDialog) {
         AddSourceDialog(
+            repo      = repo,
             onDismiss = { showAddDialog = false },
-            onAdd     = { name, url ->
-                repo.add(name, url)
+            onAdded   = {
                 sources = repo.loadAll()
                 showAddDialog = false
             },
@@ -130,15 +129,14 @@ private fun SourceCard(
     ) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
 
-            // Строка 1: название + бейджи + тоггл
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
                 if (source.isDefault) {
                     Surface(
-                        shape  = RoundedCornerShape(4.dp),
-                        color  = MaterialTheme.colorScheme.primaryContainer,
+                        shape = RoundedCornerShape(4.dp),
+                        color = MaterialTheme.colorScheme.primaryContainer,
                     ) {
                         Text(
                             "встроен",
@@ -162,7 +160,6 @@ private fun SourceCard(
                 )
             }
 
-            // Строка 2: URL
             Text(
                 source.shortUrl,
                 style    = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
@@ -172,7 +169,6 @@ private fun SourceCard(
                 fontSize = 10.sp,
             )
 
-            // Строка 3: последний результат
             if (source.lastDdCount >= 0 && testResult == null) {
                 Text(
                     "dd-прокси при последней проверке: ${source.lastDdCount}",
@@ -184,10 +180,9 @@ private fun SourceCard(
                 )
             }
 
-            // Строка 4: результат теста (в реальном времени)
             AnimatedVisibility(visible = testResult != null) {
                 Row(
-                    verticalAlignment    = Alignment.CenterVertically,
+                    verticalAlignment     = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     if (isTesting) {
@@ -195,20 +190,19 @@ private fun SourceCard(
                         Text("Проверяем...", style = MaterialTheme.typography.bodySmall)
                     } else {
                         val isGood = testResult?.startsWith("✓✓✓") == true ||
-                                (testResult?.contains("Итого:") == true && !testResult.contains(": 0"))
+                            (testResult?.contains("Итого:") == true && !testResult.contains(": 0"))
                         Text(
                             testResult ?: "",
-                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-                            fontSize = 10.sp,
+                            style      = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                            fontSize   = 10.sp,
                             lineHeight = 13.sp,
-                            color = if (isGood) MaterialTheme.colorScheme.primary
-                                    else MaterialTheme.colorScheme.error,
+                            color      = if (isGood) MaterialTheme.colorScheme.primary
+                                         else MaterialTheme.colorScheme.error,
                         )
                     }
                 }
             }
 
-            // Строка 5: кнопки
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(
                     onClick  = onTest,
@@ -237,12 +231,15 @@ private fun SourceCard(
 
 @Composable
 private fun AddSourceDialog(
+    repo: SourceRepository,
     onDismiss: () -> Unit,
-    onAdd: (name: String, url: String) -> Unit,
+    onAdded: () -> Unit,
 ) {
-    var name by remember { mutableStateOf("") }
-    var url  by remember { mutableStateOf("") }
+    var name  by remember { mutableStateOf("") }
+    var url   by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
+
+    val parser = remember { SourceParser() }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -250,7 +247,11 @@ private fun AddSourceDialog(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(
-                    "Поддерживаются:\n• GitHub raw URL (https://raw.githubusercontent.com/...)\n• Любой URL с tg://proxy ссылками",
+                    "Поддерживаются:\n" +
+                    "• https://raw.githubusercontent.com/... (список)\n" +
+                    "• tg://proxy?server=...&port=...&secret=...\n" +
+                    "• https://t.me/proxy?...\n" +
+                    "• t.me/proxy?...",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -265,11 +266,11 @@ private fun AddSourceDialog(
                     value         = url,
                     onValueChange = { url = it; error = null },
                     label         = { Text("URL") },
-                    placeholder   = { Text("https://...") },
+                    placeholder   = { Text("https://... или tg://proxy?...") },
                     singleLine    = false,
                     maxLines      = 3,
                     isError       = error != null,
-                    supportingText = error?.let { { Text(it, color = MaterialTheme.colorScheme.error) } },
+                    supportingText = error?.let { e -> { Text(e, color = MaterialTheme.colorScheme.error) } },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
                     modifier      = Modifier.fillMaxWidth(),
                 )
@@ -279,9 +280,22 @@ private fun AddSourceDialog(
             TextButton(onClick = {
                 val trimUrl = url.trim()
                 when {
-                    trimUrl.isEmpty() -> error = "Введите URL"
-                    !trimUrl.startsWith("http") -> error = "URL должен начинаться с http"
-                    else -> onAdd(name, trimUrl)
+                    trimUrl.isEmpty() -> {
+                        error = "Введите URL"
+                    }
+                    // Принимаем: https?://, tg://proxy?, t.me/proxy?
+                    !trimUrl.startsWith("http", ignoreCase = true)
+                    && !parser.isSingleProxyUrl(trimUrl) -> {
+                        error = "Ссылка должна начинаться с https://, http:// или tg://proxy?"
+                    }
+                    else -> {
+                        val added = repo.add(name, trimUrl)
+                        if (added == null) {
+                            error = "Этот источник уже добавлен"
+                        } else {
+                            onAdded()
+                        }
+                    }
                 }
             }) { Text("Добавить") }
         },
@@ -301,28 +315,20 @@ private val httpClient = OkHttpClient.Builder()
 private suspend fun testSource(url: String): String = withContext(Dispatchers.IO) {
     val parser = SourceParser()
 
-    // t.me/proxy или tg://proxy — это прямая ссылка на один прокси.
-    // Делаем ПОЛНУЮ диагностику: TCP/TLS → MTProto nonce → req_pq → resPQ.
-    // Это покажет ТОЧНО на каком шаге обрыв, без догадок.
     if (parser.isSingleProxyUrl(url)) {
         val proxy = parser.parseTgLink(url)
             ?: return@withContext "Невалидная ссылка (секрет не dd/ee или неверный формат)"
-
         val result = com.proxyguard.proxy.ProxyDiagnostic.run(proxy, timeoutMs = 10_000)
-        val lines = result.steps.mapIndexed { i, step ->
+        val lines = result.steps.mapIndexed { _, step ->
             val icon = if (step.ok) "✓" else "✗"
             "$icon ${step.name}: ${step.detail}"
         }
-        val header = if (result.success)
-            "✓✓✓ РАБОТАЕТ! ping=${result.pingMs}ms\n"
-        else
-            "✗ НЕ РАБОТАЕТ\n"
+        val header = if (result.success) "✓✓✓ РАБОТАЕТ! ping=${result.pingMs}ms\n" else "✗ НЕ РАБОТАЕТ\n"
         return@withContext header + lines.joinToString("\n")
     }
 
-    // Обычный URL — скачиваем и парсим список
     try {
-        val req = Request.Builder().url(url).build()
+        val req  = Request.Builder().url(url).build()
         val body = httpClient.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) return@withContext "HTTP ${resp.code}"
             resp.body?.string() ?: return@withContext "Пустой ответ"
@@ -340,8 +346,8 @@ private suspend fun testSource(url: String): String = withContext(Dispatchers.IO
 
 private fun parseDdCount(result: String?): Int {
     if (result == null) return -1
-    Regex("""Итого: (\d+)""").find(result).let { if (it != null) return it.groupValues[1].toIntOrNull() ?: 0 }
-    if (result.startsWith("✓✓✓")) return 1   // одиночная ссылка — РАБОТАЕТ
-    if (result.startsWith("✗")) return 0      // одиночная ссылка — не работает
+    Regex("""Итого: (\d+)""").find(result)?.let { return it.groupValues[1].toIntOrNull() ?: 0 }
+    if (result.startsWith("✓✓✓")) return 1
+    if (result.startsWith("✗"))   return 0
     return 0
 }
