@@ -2,19 +2,26 @@ package com.proxyguard.source
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
 
+/**
+ * Хранит список источников в SharedPreferences (JSON).
+ * Встроенные источники добавляются автоматически если их ещё нет.
+ */
 class SourceRepository(context: Context) {
 
     private val prefs: SharedPreferences =
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
     companion object {
-        private const val PREFS_NAME  = "proxyguard_sources"
+        private const val TAG        = "SourceRepository"
+        private const val PREFS_NAME = "proxyguard_sources"
         private const val KEY_SOURCES = "sources"
 
+        /** Встроенные источники — нельзя удалить, только отключить */
         val DEFAULT_SOURCES = listOf(
             ProxySourceConfig(
                 id        = "default_argh94",
@@ -55,6 +62,7 @@ class SourceRepository(context: Context) {
         )
     }
 
+    /** Загружает все источники (встроенные + пользовательские) */
     fun loadAll(): List<ProxySourceConfig> {
         val json = prefs.getString(KEY_SOURCES, null)
         val saved: MutableMap<String, ProxySourceConfig> = if (json != null) {
@@ -62,9 +70,15 @@ class SourceRepository(context: Context) {
         } else {
             mutableMapOf()
         }
+
+        // Гарантируем что все default sources присутствуют
         for (def in DEFAULT_SOURCES) {
-            if (def.id !in saved) saved[def.id] = def
+            if (def.id !in saved) {
+                saved[def.id] = def
+            }
         }
+
+        // Сортировка: сначала default (в порядке списка), потом пользовательские
         val defaultOrder = DEFAULT_SOURCES.map { it.id }
         return saved.values.sortedWith(compareBy(
             { if (it.id in defaultOrder) 0 else 1 },
@@ -73,35 +87,46 @@ class SourceRepository(context: Context) {
         ))
     }
 
+    /** Возвращает только enabled источники для fetch */
     fun loadEnabled(): List<ProxySourceConfig> = loadAll().filter { it.enabled }
 
-    /**
-     * Добавляет новый источник.
-     * @return новый объект, или null если URL уже существует (дубликат).
-     */
-    fun add(name: String, url: String): ProxySourceConfig? {
-        val trimUrl = url.trim()
+    /** Добавляет новый источник */
+    fun add(name: String, url: String): ProxySourceConfig {
         val sources = loadAll().toMutableList()
-
-        // Дедупликация по URL (регистр не важен, лидирующие пробелы сняты)
-        val duplicate = sources.find { it.url.trim().equals(trimUrl, ignoreCase = true) }
-        if (duplicate != null) return null
-
         val newSource = ProxySourceConfig(
             id   = UUID.randomUUID().toString(),
-            name = name.trim().ifEmpty { urlToName(trimUrl) },
-            url  = trimUrl,
+            name = name.trim().ifEmpty { urlToName(url) },
+            url  = url.trim(),
         )
         sources.add(newSource)
         save(sources)
         return newSource
     }
 
+    /** Удаляет пользовательский источник */
     fun remove(id: String) {
         val sources = loadAll().filter { it.id != id || it.isDefault }
         save(sources)
     }
 
+    /**
+     * Удаляет вручную добавленный источник-прокси (tg:// или t.me/ ссылку) по адресу сервера.
+     * Используется для авто-удаления упавших ручных прокси.
+     * Встроенные источники (isDefault = true) никогда не удаляются.
+     */
+    fun removeManualProxyByServer(server: String) {
+        val parser = SourceParser()
+        val sources = loadAll().filter { src ->
+            if (src.isDefault) return@filter true          // встроенные не трогаем
+            val proxy = parser.parseTgLink(src.url)
+            if (proxy == null) return@filter true          // не прокси-ссылка — оставляем
+            proxy.server != server                         // удаляем только совпадение
+        }
+        save(sources)
+        Log.i(TAG, "Removed manual proxy source for server: $server")
+    }
+
+    /** Переключает enabled/disabled */
     fun setEnabled(id: String, enabled: Boolean) {
         val sources = loadAll().map {
             if (it.id == id) it.copy(enabled = enabled) else it
@@ -109,15 +134,18 @@ class SourceRepository(context: Context) {
         save(sources)
     }
 
+    /** Обновляет счётчик dd-прокси после проверки */
     fun updateTestResult(id: String, ddCount: Int) {
         val sources = loadAll().map {
             if (it.id == id) it.copy(
-                lastDdCount  = ddCount,
-                lastTestedMs = System.currentTimeMillis(),
+                lastDdCount   = ddCount,
+                lastTestedMs  = System.currentTimeMillis(),
             ) else it
         }
         save(sources)
     }
+
+    // ── Приватные хелперы ─────────────────────────────────────────────────
 
     private fun save(sources: List<ProxySourceConfig>) {
         val arr = JSONArray()
@@ -148,7 +176,6 @@ class SourceRepository(context: Context) {
 
     private fun urlToName(url: String) = url
         .removePrefix("https://").removePrefix("http://")
-        .removePrefix("tg://").removePrefix("t.me/")
         .substringBefore("/").substringBefore("?")
         .take(30)
 }

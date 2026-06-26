@@ -23,22 +23,19 @@ class MtProtoObfuscation(
     private val encryptCipher: Cipher,  // этот узел → удалённая сторона
     private val decryptCipher: Cipher,  // удалённая сторона → этот узел
 ) {
-    /** Шифрует [data], возвращает новый массив. Используется только при первоначальном handshake. */
     fun encrypt(data: ByteArray): ByteArray = encryptCipher.update(data)
-    /** Дешифрует [data], возвращает новый массив. Используется только при первоначальном handshake. */
     fun decrypt(data: ByteArray): ByteArray = decryptCipher.update(data)
 
     /**
-     * Zero-copy шифрование: записывает результат прямо в [output] без промежуточных аллокаций.
-     * Для AES/CTR/NoPadding длина вывода == [len] (stream cipher, нет padding).
-     * Вызывается из relay pipe() на каждом чанке данных.
+     * Zero-copy шифрование: пишет результат прямо в [output] без промежуточных аллокаций.
+     * Для AES/CTR/NoPadding: outputLen == [len] (stream cipher, без padding).
      */
     fun encryptInto(input: ByteArray, len: Int, output: ByteArray) {
         encryptCipher.update(input, 0, len, output, 0)
     }
 
     /**
-     * Zero-copy дешифрование: записывает результат прямо в [output] без промежуточных аллокаций.
+     * Zero-copy дешифрование: пишет результат прямо в [output] без промежуточных аллокаций.
      */
     fun decryptInto(input: ByteArray, len: Int, output: ByteArray) {
         decryptCipher.update(input, 0, len, output, 0)
@@ -132,6 +129,27 @@ class MtProtoObfuscation(
             }
         }
 
+        /**
+         * Каноничный вывод ключей obfuscated2 / padded-intermediate.
+         * Сверено с тремя независимыми реализациями (alexbers/mtprotoproxy,
+         * seriyps/mtproto_proxy, Flowseal/tg-ws-proxy) — все три сходятся в этом алгоритме.
+         *
+         * block48 = init[8..56) = prekey(32 байта) ++ iv(16 байт)
+         *
+         * Направление A («как есть»):
+         *   prekeyA = block48[0..32), ivA = block48[32..48)
+         *
+         * Направление B (reversed):
+         *   ВЕСЬ 48-байтовый block48 реверсируется КАК ЕДИНЫЙ БУФЕР
+         *   (НЕ prekey и iv по отдельности!), затем нарезается заново на 32+16:
+         *   block48Rev = reverse(block48); prekeyB = block48Rev[0..32), ivB = block48Rev[32..48)
+         *
+         * Ключ: sha256(prekey ++ secret) — prekey ПЕРВЫМ, secret ВТОРЫМ.
+         * (Раньше тут было sha256(secret + prekey) — обратный порядок —
+         *  и реверс prekey/iv по отдельности вместо реверса всего блока.
+         *  Из-за лавинного эффекта SHA-256 это давало два независимых, полностью
+         *  не совпадающих с реальным сервером ключа в обоих направлениях.)
+         */
         private fun deriveKeys(init: ByteArray, secret: ByteArray): KeySet {
             val block48 = init.copyOfRange(8, 56)        // prekey(32) ++ iv(16)
             val prekeyA = block48.copyOfRange(0, 32)
@@ -141,7 +159,7 @@ class MtProtoObfuscation(
             val prekeyB = block48Rev.copyOfRange(0, 32)
             val ivB     = block48Rev.copyOfRange(32, 48)
 
-            val keyA = sha256(prekeyA + secret)            // prekey ++ secret
+            val keyA = sha256(prekeyA + secret)            // prekey ++ secret, не secret ++ prekey
             val keyB = sha256(prekeyB + secret)
 
             return KeySet(keyA, ivA, keyB, ivB)
@@ -154,6 +172,8 @@ class MtProtoObfuscation(
 
         private fun aesCtr(key: ByteArray, iv: ByteArray): Cipher =
             Cipher.getInstance("AES/CTR/NoPadding").apply {
+                // В CTR-режиме ENCRYPT и DECRYPT идентичны (XOR с keystream).
+                // Используем ENCRYPT_MODE для обоих — без разницы.
                 init(
                     Cipher.ENCRYPT_MODE,
                     SecretKeySpec(key.copyOfRange(0, 32), "AES"),

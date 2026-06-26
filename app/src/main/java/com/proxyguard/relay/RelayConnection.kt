@@ -15,6 +15,11 @@ class RelayConnection(
     private val bridgeSecret: ByteArray,
 ) {
 
+    /**
+     * Результат работы одного pipe-направления.
+     * CLEAN  = read() вернул -1 (нормальный EOF, удалённая сторона закрыла соединение)
+     * ERROR  = бросил исключение (socket reset, timeout, и т.д.)
+     */
     private enum class PipeEnd { CLEAN, ERROR }
 
     suspend fun handle() {
@@ -65,37 +70,32 @@ class RelayConnection(
 
         // 6. Двунаправленный relay
         //
-        // Zero-copy: каждый из двух pipe() выделяет 3 буфера по BUFFER_SIZE ОДИН РАЗ
-        // и переиспользует их на протяжении всей жизни соединения.
-        // До этого фикса pipe создавал 3 новых ByteArray на КАЖДЫЙ чанк:
-        //   copyOfRange + Cipher.update (×2) = 3 аллокации × 8KB × ~500 чанков/сек = GC death.
+        // Логика определения причины обрыва:
+        //   Первый pipe, который завершился — ИНИЦИАТОР обрыва.
+        //   Если инициатор — сторона proxy (p2t) → прокси умер → markFailed.
+        //   Если инициатор — сторона Telegram (t2p) → Telegram закрыл сам → прокси живой.
+        //   Второй pipe всегда получает ERROR (мы сами закрываем его сокет в invokeOnCompletion).
         //
-        // Кто завершился первым — тот инициатор обрыва:
-        //   proxy: (p→t) → прокси умер → markFailed
-        //   telegram: (t→p) → Telegram закрыл сам → прокси живой
-        //
-        val firstTerminator = AtomicReference<String?>(null)
+        val firstTerminator = AtomicReference<String?>(null)  // "telegram:CLEAN/ERROR" или "proxy:CLEAN/ERROR"
 
         try {
             coroutineScope {
                 val t2p = launch(Dispatchers.IO) {
-                    // Telegram → ProxyGuard: decrypt bridge, encrypt proxy
                     val (end, msg) = pipe(
-                        from   = telegramSocket.getInputStream(),
-                        to     = proxyLink.output,
-                        step1  = bridgeCipher::decryptInto,   // снять bridge-шифрование
-                        step2  = proxyCipher::encryptInto,    // наложить proxy-шифрование
+                        from  = telegramSocket.getInputStream(),
+                        to    = proxyLink.output,
+                        step1 = bridgeCipher::decryptInto,   // bridge-шифр → plaintext
+                        step2 = proxyCipher::encryptInto,    // plaintext → proxy-шифр
                     )
                     val isFirst = firstTerminator.compareAndSet(null, "telegram:$end")
                     Log.d(TAG, "${proxy.server}: t→p $end${if (isFirst) " [init]" else ""}${msg?.let { " — $it" } ?: ""}")
                 }
                 val p2t = launch(Dispatchers.IO) {
-                    // Proxy → Telegram: decrypt proxy, encrypt bridge
                     val (end, msg) = pipe(
-                        from   = proxyLink.input,
-                        to     = telegramSocket.getOutputStream(),
-                        step1  = proxyCipher::decryptInto,    // снять proxy-шифрование
-                        step2  = bridgeCipher::encryptInto,   // наложить bridge-шифрование
+                        from  = proxyLink.input,
+                        to    = telegramSocket.getOutputStream(),
+                        step1 = proxyCipher::decryptInto,    // proxy-шифр → plaintext
+                        step2 = bridgeCipher::encryptInto,   // plaintext → bridge-шифр
                     )
                     val isFirst = firstTerminator.compareAndSet(null, "proxy:$end")
                     Log.d(TAG, "${proxy.server}: p→t $end${if (isFirst) " [init]" else ""}${msg?.let { " — $it" } ?: ""}")
@@ -119,13 +119,16 @@ class RelayConnection(
             proxyLink.close()
         }
 
+        // Оцениваем причину завершения
         val term = firstTerminator.get() ?: "unknown"
         when {
             term.startsWith("proxy:") -> {
+                // Прокси закрыл соединение первым (EOF или ошибка) — помечаем мёртвым
                 Log.w(TAG, "Relay ended: ${proxy.server} closed first ($term) → markFailed")
                 proxyPool.markFailed(proxy)
             }
             term.startsWith("telegram:") -> {
+                // Telegram закрыл первым — нормально, прокси живой
                 Log.i(TAG, "Relay ended: Telegram closed first ($term), proxy ${proxy.server} OK")
             }
             else -> Log.w(TAG, "Relay ended: unknown terminator=$term")
@@ -141,16 +144,15 @@ class RelayConnection(
     }
 
     /**
-     * Zero-copy relay pipe.
+     * Zero-copy relay pipe: 3 буфера выделяются ОДИН РАЗ при старте функции
+     * и переиспользуются на всём протяжении соединения.
      *
-     * Выделяет 3 буфера по [BUFFER_SIZE] ОДИН раз при запуске.
-     * На каждом чанке вызывает [step1] и [step2] — Cipher.update(in,off,len,out,off) —
-     * которые пишут результат напрямую в предоставленный буфер без аллокаций.
+     * Было: buf.copyOfRange(0,n) + Cipher.update × 2 = 3 новых ByteArray на каждый чанк
+     *        → при видео ~1500 аллокаций/сек × 8KB = 12MB/с мусора → GC-паузы → таймауты
+     * Стало: 0 аллокаций на чанк
      *
-     * Итого: 0 аллокаций на чанк вместо 3 × 8KB при старом подходе.
-     *
-     * @param step1  первое криптопреобразование: (input, len, output) → Unit
-     * @param step2  второе криптопреобразование: (input, len, output) → Unit
+     * @param step1  первый шаг: decrypt (input → mid)
+     * @param step2  второй шаг: encrypt (mid → out)
      */
     private fun pipe(
         from:  InputStream,
@@ -179,16 +181,16 @@ class RelayConnection(
 
     private suspend fun waitForProxy() = withTimeoutOrNull(POOL_WAIT_MS) {
         while (proxyPool.isEmpty()) { delay(POOL_POLL_MS) }
-        proxyPool.getBest()   // всегда лучший по ping — load-spread здесь противопоказан
+        proxyPool.getForConnection()   // load-spread по ручным прокси, не всегда один и тот же
     }
 
     private fun ByteArray.toHex() = joinToString("") { "%02x".format(it) }
 
     companion object {
         private const val TAG             = "RelayConnection"
-        private const val CONNECT_TIMEOUT = 5_000
-        private const val BUFFER_SIZE     = 16_384   // 8KB → 16KB: меньше read() вызовов при видео
-        private const val POOL_WAIT_MS    = 30_000L
+        private const val CONNECT_TIMEOUT = 5_000        // 10s → 5s, быстрее детектируем мёртвые
+        private const val BUFFER_SIZE     = 16_384   // 8KB → 16KB: меньше read() при видео
+        private const val POOL_WAIT_MS    = 30_000L      // 80s → 30s
         private const val POOL_POLL_MS    = 2_000L
     }
 }

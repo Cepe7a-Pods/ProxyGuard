@@ -94,11 +94,20 @@ class ProxyGuardService : LifecycleService() {
             validator = validator,
             onProxyFailed = { dead, next ->
                 val text = if (next != null)
-                    "⚠ $dead недоступен → $next | Пул: ${proxyPool.size()}"
+                    "⚠ ${dead.server} недоступен → ${next.server} | Пул: ${proxyPool.size()}"
                 else
                     "⚠ Нет живых прокси — обновляю..."
                 persistAndBroadcast(text, proxyPool.size(), isLoading = next == null)
                 notify(text)
+
+                // Если прокси был добавлен вручную — удаляем из списка источников
+                // (упал 2 раза подряд = нерабочий, незачем хранить)
+                if (dead.isManual) {
+                    lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                        sourceRepo.removeManualProxyByServer(dead.server)
+                    }
+                }
+
                 // Если пул исчерпан — инициируем полный refresh
                 if (next == null) lifecycleScope.launch { updateProxies() }
             },
