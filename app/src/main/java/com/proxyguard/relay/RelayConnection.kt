@@ -123,9 +123,15 @@ class RelayConnection(
         val term = firstTerminator.get() ?: "unknown"
         when {
             term.startsWith("proxy:") -> {
-                // Прокси закрыл соединение первым (EOF или ошибка) — помечаем мёртвым
-                Log.w(TAG, "Relay ended: ${proxy.server} closed first ($term) → markFailed")
-                proxyPool.markFailed(proxy)
+                // Прокси закрыл соединение первым — возможен rate-limit, а не гибель.
+                // softFail: 1-й раз → убираем из ротации временно,
+                //           2-й раз → удаляем из пула (SOFT_FAIL_LIMIT = 2)
+                val evicted = proxyPool.softFail(proxy)
+                if (evicted) {
+                    Log.w(TAG, "Relay ended: ${proxy.server} closed first ($term) → evicted from pool")
+                } else {
+                    Log.w(TAG, "Relay ended: ${proxy.server} closed first ($term) → suspended (soft-fail)")
+                }
             }
             term.startsWith("telegram:") -> {
                 // Telegram закрыл первым — нормально, прокси живой

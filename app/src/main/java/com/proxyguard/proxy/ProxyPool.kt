@@ -1,13 +1,16 @@
 package com.proxyguard.proxy
 
 import android.util.Log
+import java.util.concurrent.atomic.AtomicInteger
 
 class ProxyPool {
 
     @Volatile private var sorted: List<MtProtoProxy> = emptyList()
     @Volatile private var failed: Set<String>        = emptySet()
     private val rng = kotlin.random.Random.Default
-    @Volatile private var connectionRoundRobin: Int  = 0   // для round-robin в getForConnection
+    // AtomicInteger вместо @Volatile Int: getAndIncrement() — атомарен,
+    // два потока никогда не получат одинаковый индекс (была гонка с ++ на Volatile)
+    private val connectionRoundRobin = AtomicInteger(0)
 
     // Счётчик мягких отказов (health-check провалы).
     // Сбрасывается при каждом update() — после полной ре-валидации.
@@ -44,7 +47,8 @@ class ProxyPool {
         if (alive.isEmpty()) return null
         val manualAlive = alive.filter { it.isManual }
         val candidates = if (manualAlive.isNotEmpty()) manualAlive else alive.take(CONNECTION_SPREAD)
-        val idx = (connectionRoundRobin++ % candidates.size).coerceAtLeast(0)
+        // Math.floorMod гарантирует неотрицательный результат даже при переполнении AtomicInteger
+        val idx = Math.floorMod(connectionRoundRobin.getAndIncrement(), candidates.size)
         return candidates[idx]
     }
 
