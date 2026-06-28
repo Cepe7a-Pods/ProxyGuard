@@ -34,6 +34,10 @@ class ProxyGuardService : LifecycleService() {
 
     @Volatile private var isUpdating = false
 
+    // Счётчик провалов валидации по каждому ручному прокси (key = server:port).
+    // Когда прокси проваливает валидацию VALIDATION_FAIL_LIMIT раз подряд — удаляем из источников.
+    private val validationFailCounts = mutableMapOf<String, Int>()
+
     companion object {
         private const val TAG              = "ProxyGuardService"
         const val PORT                     = 1080
@@ -47,7 +51,8 @@ class ProxyGuardService : LifecycleService() {
         private const val NOTIFICATION_ID  = 1001
         private const val CHANNEL_ID       = "proxyguard_status"
         private const val UPDATE_INTERVAL  = 15 * 60 * 1000L
-        private const val MIN_EARLY_POOL   = 1    // запустить relay как только нашли N рабочих прокси
+        private const val MIN_EARLY_POOL       = 1    // запустить relay как только нашли N рабочих прокси
+        private const val VALIDATION_FAIL_LIMIT = 2    // сколько раз подряд должен упасть ручной прокси чтобы его удалили
         private const val BATCH_SIZE       = 25   // прокси проверяются батчами по N
 
         // SharedPreferences — единственный источник истины для UI
@@ -219,6 +224,36 @@ class ProxyGuardService : LifecycleService() {
             persistAndBroadcast(text, ranked.size, isLoading = false)
             notify(text)
 
+            // Трекинг провалов валидации ручных прокси.
+            // Сравниваем что запрашивали (all) с тем что прошло валидацию (ranked).
+            // Ручной прокси не прошедший N раз подряд — удаляем из SourceRepository.
+            val rankedManualServers = ranked
+                .filter { it.proxy.isManual }
+                .map { it.proxy.server }
+                .toSet()
+            val allManualServers = all
+                .filter { it.isManual }
+                .map { it.server }
+                .toSet()
+            for (server in allManualServers) {
+                if (server in rankedManualServers) {
+                    // Прокси прошёл — сбрасываем счётчик
+                    validationFailCounts.remove(server)
+                } else {
+                    // Прокси провалился — инкрементируем
+                    val count = (validationFailCounts[server] ?: 0) + 1
+                    validationFailCounts[server] = count
+                    Log.d(TAG, "Validation fail: $server ($count/$VALIDATION_FAIL_LIMIT)")
+                    if (count >= VALIDATION_FAIL_LIMIT) {
+                        Log.w(TAG, "Auto-removing consistently failing proxy source: $server")
+                        withContext(kotlinx.coroutines.Dispatchers.IO) {
+                            sourceRepo.removeManualProxyByServer(server)
+                        }
+                        validationFailCounts.remove(server)
+                    }
+                }
+            }
+
         } catch (e: Exception) {
             Log.e(TAG, "Update error: ${e.message}")
             val text = "⚠ Ошибка обновления. Повтор через 15 мин."
@@ -298,11 +333,17 @@ class ProxyGuardService : LifecycleService() {
             Intent(this, ProxyGuardService::class.java).setAction(ACTION_REFRESH),
             PendingIntent.FLAG_IMMUTABLE,
         )
+        val nextProxy = PendingIntent.getService(
+            this, 3,
+            Intent(this, ProxyGuardService::class.java).setAction(ACTION_NEXT_PROXY),
+            PendingIntent.FLAG_IMMUTABLE,
+        )
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_shield)
             .setContentTitle("ProxyGuard")
             .setContentText(text)
             .setContentIntent(open)
+            .addAction(0, "⏭", nextProxy)
             .addAction(0, "🔄", refresh)
             .addAction(0, "⏹", stop)
             .setOngoing(true)

@@ -42,8 +42,18 @@ class ProxyUpdateWorker(
                 return Result.retry()
             }
 
-            repository.save(ranked)
-            Log.i(TAG, "Background update done: ${ranked.size} live proxies")
+            // Мёрдж: ручные прокси из кэша НЕ перезаписываем авто-результатами.
+            // isManual=true — добавлены пользователем вручную, ProxyUpdateWorker их не трогает.
+            val existing = repository.load(maxAgeMs = Long.MAX_VALUE)
+            // Явный тип нужен: Kotlin не выводит тип it при конкатенации двух List<RankedProxy>
+            // key() — приватная extension в ProxyPool, используем server:port напрямую
+            val manualCached: List<com.proxyguard.proxy.RankedProxy> = existing.filter { it.proxy.isManual }
+            val merged: List<com.proxyguard.proxy.RankedProxy> = (manualCached + ranked)
+                .distinctBy { "${it.proxy.server}:${it.proxy.port}" }
+                .sortedBy { it.pingMs }
+
+            repository.save(merged)
+            Log.i(TAG, "Background update done: ${ranked.size} auto + ${manualCached.size} manual = ${merged.size} total")
             Result.success()
 
         } catch (e: Exception) {
